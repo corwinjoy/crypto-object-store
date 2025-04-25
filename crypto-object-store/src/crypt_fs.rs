@@ -13,8 +13,15 @@ pub struct CryptFileSystem {
 }
 
 impl CryptFileSystem {
+    
+    /*
     pub fn new() -> Self {
         Self { fs: LocalFileSystem::new() }
+    }
+     */
+
+    pub fn new_with_prefix(prefix: impl AsRef<std::path::Path>) -> object_store::Result<Self> {
+        Ok(Self { fs: LocalFileSystem::new_with_prefix(prefix)? })
     }
 }
 

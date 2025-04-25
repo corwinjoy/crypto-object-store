@@ -19,7 +19,7 @@ use deltalake::{protocol::SaveMode, DeltaOps};
 
 use std::sync::Arc;
 use deltalake_core::{DeltaTableBuilder, DeltaTableError};
-use deltalake::storage::object_store::local::LocalFileSystem;
+// use deltalake::storage::object_store::local::LocalFileSystem;
 use url::Url;
 mod crypt_fs;
 
@@ -105,8 +105,8 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     let path = "/home/cjoy/src/crypto-object-store/crypto-object-store/test_crypt";
     let joined = String::from("file://") + path;
     let table_uri = joined.as_str();
-    // let file_store = Arc::new(CryptFileSystem::new()); // Starting ObjectStore
-    let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?); // Starting ObjectStore
+    let file_store = Arc::new(CryptFileSystem::new_with_prefix(path)?); // Starting ObjectStore
+    // let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?); // Starting ObjectStore
 
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
