@@ -23,7 +23,8 @@ use deltalake_core::{DeltaTableBuilder, DeltaTableError};
 use url::Url;
 mod crypt_fs;
 use crypt_fs::CryptFileSystem;
-use log::{info, trace, warn};
+// use log::{info, trace, warn};
+use log::{info};
 
 
 fn get_table_columns() -> Vec<StructField> {

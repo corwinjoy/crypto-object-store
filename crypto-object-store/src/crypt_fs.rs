@@ -7,7 +7,8 @@ use object_store::{ObjectStore, local::LocalFileSystem, PutPayload, PutResult,
                                        GetOptions, ListResult};
 use deltalake::{ObjectMeta, Path};
 
-use log::{info, trace, warn};
+//use log::{info, trace, warn};
+use log::{warn};
 
 #[derive(Debug)]
 pub struct CryptFileSystem {
