@@ -22,8 +22,9 @@ use deltalake_core::{DeltaTableBuilder, DeltaTableError};
 // use deltalake::storage::object_store::local::LocalFileSystem;
 use url::Url;
 mod crypt_fs;
-
 use crypt_fs::CryptFileSystem;
+use log::{info, trace, warn};
+
 
 fn get_table_columns() -> Vec<StructField> {
     vec![
@@ -101,6 +102,9 @@ fn get_table_batches() -> RecordBatch {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
+    use log::LevelFilter;
+    simple_logging::log_to_file("crypt_fs.log", LevelFilter::Trace)?;
+    
     // Create a delta operations client pointing at an un-initialized location.
     let path = "/home/cjoy/src/crypto-object-store/crypto-object-store/test_crypt";
     let joined = String::from("file://") + path;
@@ -111,21 +115,29 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
 
+    info!("start DeltaTableBuilder::build");
+
     let mut table = DeltaTableBuilder::from_valid_uri(table_uri)
         .unwrap()
         .with_storage_backend(file_store, Url::parse(table_uri).unwrap())
         .build()?;
 
+    info!("finish DeltaTableBuilder::build");
+
+
     // We allow for uninitialized locations, since we may want to create the table
+    info!("start table.load");
     let ops: DeltaOps = match table.load().await {
         Ok(_) => Ok(table.into()),
         Err(DeltaTableError::NotATable(_)) => Ok(table.into()),
         Err(err) => Err(err),
     }?;
+    info!("finish table.load");
 
     // The operations module uses a builder pattern that allows specifying several options
     // on how the command behaves. The builders implement `Into<Future>`, so once
     // options are set you can run the command using `.await`.
+    info!("start table.create");
     let table = ops
         .create()
         .with_columns(get_table_columns())
@@ -133,6 +145,7 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
         .with_table_name("my_table")
         .with_comment("A table to show how delta-rs works")
         .await?;
+    info!("finish table.create");
 
     assert_eq!(table.version(), 0);
 
@@ -141,10 +154,12 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
         .build();
 
     let batch = get_table_batches();
+    info!("start table.write");
     let table = DeltaOps(table)
         .write(vec![batch.clone()])
         .with_writer_properties(writer_properties)
         .await?;
+    info!("finish table.write");
 
     assert_eq!(table.version(), 1);
 
@@ -153,16 +168,20 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
         .build();
 
     // To overwrite instead of append (which is the default), use `.with_save_mode`:
+    info!("start table.write append");
     let table = DeltaOps(table)
         .write(vec![batch.clone()])
         .with_save_mode(SaveMode::Overwrite)
         .with_writer_properties(writer_properties)
         .await?;
+    info!("finish table.write append");
 
     assert_eq!(table.version(), 2);
 
+    info!("start table.load");
     let (_table, stream) = DeltaOps(table).load().await?;
     let data: Vec<RecordBatch> = collect_sendable_stream(stream).await?;
+    info!("finish table.load");
 
     println!("{data:?}");
 

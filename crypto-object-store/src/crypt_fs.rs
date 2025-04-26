@@ -2,10 +2,12 @@ use std::fmt::{Display, Formatter};
 use std::ops::Range;
 use async_trait::async_trait;
 use deltalake::storage::object_store;
-use object_store::{ObjectStore, local::LocalFileSystem, PutPayload, PutResult, 
-                                       PutOptions, MultipartUpload, PutMultipartOpts, GetResult, 
+use object_store::{ObjectStore, local::LocalFileSystem, PutPayload, PutResult,
+                                       PutOptions, MultipartUpload, PutMultipartOpts, GetResult,
                                        GetOptions, ListResult};
 use deltalake::{ObjectMeta, Path};
+
+use log::{info, trace, warn};
 
 #[derive(Debug)]
 pub struct CryptFileSystem {
@@ -13,7 +15,7 @@ pub struct CryptFileSystem {
 }
 
 impl CryptFileSystem {
-    
+
     /*
     pub fn new() -> Self {
         Self { fs: LocalFileSystem::new() }
@@ -34,37 +36,49 @@ impl Display for CryptFileSystem {
 #[async_trait]
 impl ObjectStore for CryptFileSystem {
     async fn put(&self, location: &Path, payload: PutPayload) -> object_store::Result<PutResult> {
+        warn!("put");
         self.fs.put(location, payload).await
     }
     
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+        warn!("put_opts");
         self.fs.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart(&self, location: &Path) -> object_store::Result<Box<dyn MultipartUpload>> {
+        warn!("put_multipart");
         self.fs.put_multipart(location).await
     }
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload>> {
+        warn!("put_multipart_opts");
         self.fs.put_multipart_opts(location, opts).await
     }
 
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
+        warn!("get");
         self.fs.get(location).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        warn!("get_opts");
         self.fs.get_opts(location, options).await 
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<bytes::Bytes> {
+        warn!("get_range");
         self.fs.get_range(location, range).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> object_store::Result<Vec<bytes::Bytes>> {
+        warn!("get_ranges");
         self.fs.get_ranges(location, ranges).await
     }
 
+    ////////////////////////////////////////////////////////////////////////////////////
+    // The rest of these functions operate at the file system level and should all
+    // be just pass throughs
+    ////////////////////////////////////////////////////////////////////////////////////
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         self.fs.head(location).await
     }
