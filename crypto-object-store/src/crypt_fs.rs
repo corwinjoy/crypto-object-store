@@ -116,12 +116,16 @@ impl ObjectStore for CryptFileSystem {
     }
 
     async fn put_multipart(&self, location: &Path) -> object_store::Result<Box<dyn MultipartUpload>> {
+        // TODO
         warn!("put_multipart");
+        panic!("not implemented");
         self.fs.put_multipart(location).await
     }
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload>> {
+        // TODO
         warn!("put_multipart_opts");
+        panic!("not implemented");
         self.fs.put_multipart_opts(location, opts).await
     }
 
