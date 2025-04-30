@@ -1,14 +1,17 @@
 use std::fmt::{Display, Formatter};
+use std::io::SeekFrom;
 use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deltalake::storage::object_store;
 use object_store::{ObjectStore, local::LocalFileSystem, PutPayload, PutResult,
                                        PutOptions, MultipartUpload, PutMultipartOpts, GetResult,
-                                       GetOptions, ListResult};
+                                       GetOptions, ListResult, Attributes};
 use deltalake::{ObjectMeta, Path};
 use cocoon;
-use deltalake_core::storage::object_store::GetResultPayload;
+use deltalake_core::storage::object_store::{GetResultPayload, UploadPart};
 use deltalake_core::storage::object_store::memory::InMemory;
 //use log::{info, trace, warn};
 use log::{warn};
@@ -58,13 +61,16 @@ impl CryptFileSystem {
         Ok(decrypted.unwrap())
     }
 
-    async fn encrypted_payload(&self, location: &Path, payload: PutPayload) -> object_store::Result<PutPayload> {
+    async fn encrypted_payloads(&self, location: &Path, payloads: &Vec<PutPayload>) -> object_store::Result<PutPayload> {
         // Eventually, we can hopefully do this block-wise by using payload.to_iter()
 
         // Buffer the payload in memory
         let ms = InMemory::new();
         let tmp = Path::from("tmp");
-        ms.put(&tmp, payload).await?;
+        for payload in payloads {
+            ms.put(&tmp, payload.clone()).await?;
+        }
+        
         let result: GetResult = ms.get(&tmp).await?;
         let bytes = result.bytes().await?;
 
@@ -72,6 +78,11 @@ impl CryptFileSystem {
         let encrypted = self.encrypt(location, &*bytes).unwrap();
         let encrypted_payload = PutPayload::from(encrypted);
         Ok(encrypted_payload)
+    }
+
+    async fn encrypted_payload(&self, location: &Path, payload: PutPayload) -> object_store::Result<PutPayload> {
+        let payloads = vec![payload];
+        self.encrypted_payloads(location, &payloads).await
     }
 
     async fn decrypted_get_result(&self, location: &Path, gr: GetResult) -> object_store::Result<GetResult> {
@@ -100,6 +111,54 @@ impl CryptFileSystem {
     }
 }
 
+#[derive(Debug)]
+pub struct CryptUpload<'a> {
+    /// The final destination
+    dest: Path,
+    
+    /// Associated encrypted store
+    cfs: &'a CryptFileSystem,
+    
+    /// Vector of payloads to write
+    parts: Vec<PutPayload>,
+    
+    /// Write attributes
+    attributes: Attributes,
+}
+
+impl<'a> CryptUpload<'a> {
+    pub fn new(dest: Path, cfs: &'a CryptFileSystem) -> CryptUpload<'a> {
+        Self { dest, cfs, parts: vec![], attributes: Attributes::new() }
+    }
+
+    pub fn new_with_attributes(dest: Path, cfs: &'a CryptFileSystem, attributes: Attributes) -> CryptUpload<'a> {
+        Self { dest, cfs, parts: vec![], attributes }
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for CryptUpload<'_> {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.parts.push(data);
+        Box::pin(futures::future::ready(Ok(())))
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let encrypted_payload = self.cfs.encrypted_payloads(&self.dest, &self.parts).await?;
+
+        if self.attributes.is_empty() {
+            return self.cfs.fs.put(&self.dest, encrypted_payload).await
+        }
+        
+        let opts : PutOptions = self.attributes.clone().into();
+        self.cfs.fs.put_opts(&self.dest, encrypted_payload, opts).await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        Ok(())
+    }
+}
+
 
 #[async_trait]
 impl ObjectStore for CryptFileSystem {
@@ -115,18 +174,14 @@ impl ObjectStore for CryptFileSystem {
         self.fs.put_opts(location, encrypted_payload, opts).await
     }
 
-    async fn put_multipart(&self, location: &Path) -> object_store::Result<Box<dyn MultipartUpload>> {
-        // TODO
+    async fn put_multipart<'a>(&'a self, location: &Path) -> object_store::Result<Box<dyn MultipartUpload + 'a>>{
         warn!("put_multipart");
-        panic!("not implemented");
-        self.fs.put_multipart(location).await
+        Ok(Box::new(CryptUpload::new(location.clone(), &self)))
     }
 
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload>> {
-        // TODO
+    async fn put_multipart_opts<'a>(&'a self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload+ 'a>> {
         warn!("put_multipart_opts");
-        panic!("not implemented");
-        self.fs.put_multipart_opts(location, opts).await
+        Ok(Box::new(CryptUpload::new_with_attributes(location.clone(), &self, opts.attributes.clone())))
     }
 
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
