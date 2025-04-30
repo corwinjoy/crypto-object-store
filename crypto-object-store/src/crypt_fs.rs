@@ -1,7 +1,5 @@
 use std::fmt::{Display, Formatter};
-use std::io::SeekFrom;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,16 +16,15 @@ use log::{warn};
 use show_bytes::show_bytes;
 use futures::{StreamExt};
 
-// let mut cocoon = Cocoon::new(b"password");
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CryptFileSystem {
-    fs: LocalFileSystem,
+    os: Arc<dyn ObjectStore>,
     crypt_key: Vec<u8>,
 }
 
 impl Display for CryptFileSystem {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "fs: {}, crypt_key: {}", self.fs, show_bytes(self.crypt_key.clone()))
+        write!(f, "os: {}, crypt_key: {}", self.os, show_bytes(self.crypt_key.clone()))
     }
 }
 
@@ -40,7 +37,7 @@ impl CryptFileSystem {
      */
 
     pub fn new_with_prefix(prefix: impl AsRef<std::path::Path>, crypt_key: Vec<u8>) -> object_store::Result<Self> {
-        Ok(Self { fs: LocalFileSystem::new_with_prefix(prefix)? , crypt_key})
+        Ok(Self { os: Arc::new(LocalFileSystem::new_with_prefix(prefix)?) , crypt_key})
     }
 
     pub fn encrypt(&self, _location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -112,12 +109,12 @@ impl CryptFileSystem {
 }
 
 #[derive(Debug)]
-pub struct CryptUpload<'a> {
+pub struct CryptUpload {
     /// The final destination
     dest: Path,
     
     /// Associated encrypted store
-    cfs: &'a CryptFileSystem,
+    cfs: CryptFileSystem,
     
     /// Vector of payloads to write
     parts: Vec<PutPayload>,
@@ -126,18 +123,18 @@ pub struct CryptUpload<'a> {
     attributes: Attributes,
 }
 
-impl<'a> CryptUpload<'a> {
-    pub fn new(dest: Path, cfs: &'a CryptFileSystem) -> CryptUpload<'a> {
-        Self { dest, cfs, parts: vec![], attributes: Attributes::new() }
+impl CryptUpload{
+    pub fn new(dest: Path, cfs: &CryptFileSystem) -> Self {
+        Self { dest, cfs: cfs.clone(), parts: vec![], attributes: Attributes::new() }
     }
 
-    pub fn new_with_attributes(dest: Path, cfs: &'a CryptFileSystem, attributes: Attributes) -> CryptUpload<'a> {
-        Self { dest, cfs, parts: vec![], attributes }
+    pub fn new_with_attributes(dest: Path, cfs: &CryptFileSystem, attributes: Attributes) -> Self {
+        Self { dest, cfs: cfs.clone(), parts: vec![], attributes }
     }
 }
 
 #[async_trait]
-impl MultipartUpload for CryptUpload<'_> {
+impl MultipartUpload for CryptUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         self.parts.push(data);
         Box::pin(futures::future::ready(Ok(())))
@@ -147,11 +144,11 @@ impl MultipartUpload for CryptUpload<'_> {
         let encrypted_payload = self.cfs.encrypted_payloads(&self.dest, &self.parts).await?;
 
         if self.attributes.is_empty() {
-            return self.cfs.fs.put(&self.dest, encrypted_payload).await
+            return self.cfs.os.put(&self.dest, encrypted_payload).await
         }
         
         let opts : PutOptions = self.attributes.clone().into();
-        self.cfs.fs.put_opts(&self.dest, encrypted_payload, opts).await
+        self.cfs.os.put_opts(&self.dest, encrypted_payload, opts).await
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
@@ -165,47 +162,47 @@ impl ObjectStore for CryptFileSystem {
     async fn put(&self, location: &Path, payload: PutPayload) -> object_store::Result<PutResult> {
         warn!("put");
         let encrypted_payload = self.encrypted_payload(location, payload).await?;
-        self.fs.put(location, encrypted_payload).await
+        self.os.put(location, encrypted_payload).await
     }
     
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
         warn!("put_opts");
         let encrypted_payload = self.encrypted_payload(location, payload).await?;
-        self.fs.put_opts(location, encrypted_payload, opts).await
+        self.os.put_opts(location, encrypted_payload, opts).await
     }
 
-    async fn put_multipart<'a>(&'a self, location: &Path) -> object_store::Result<Box<dyn MultipartUpload + 'a>>{
+    async fn put_multipart(&self, location: &Path) -> object_store::Result<Box<dyn MultipartUpload>>{
         warn!("put_multipart");
         Ok(Box::new(CryptUpload::new(location.clone(), &self)))
     }
 
-    async fn put_multipart_opts<'a>(&'a self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload+ 'a>> {
+    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload>> {
         warn!("put_multipart_opts");
         Ok(Box::new(CryptUpload::new_with_attributes(location.clone(), &self, opts.attributes.clone())))
     }
 
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
         warn!("get");
-        let gr = self.fs.get(location).await?;
+        let gr = self.os.get(location).await?;
         self.decrypted_get_result(location, gr).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
         warn!("get_opts");
-        let gr = self.fs.get_opts(location, options).await?;
+        let gr = self.os.get_opts(location, options).await?;
         self.decrypted_get_result(location, gr).await
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
         warn!("get_range");
-        let gr = self.get(location).await?;
+        let gr = self.os.get(location).await?;
         let db = self.decrypted_bytes(location, gr).await?;
         Ok(db.slice(range))
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> object_store::Result<Vec<Bytes>> {
         warn!("get_ranges");
-        let gr = self.get(location).await?;
+        let gr = self.os.get(location).await?;
         let db = self.decrypted_bytes(location, gr).await?;
         let ranges = ranges.to_vec();
         ranges
@@ -249,45 +246,45 @@ impl ObjectStore for CryptFileSystem {
     // be just pass throughs
     ////////////////////////////////////////////////////////////////////////////////////
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.fs.head(location).await
+        self.os.head(location).await
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.fs.delete(location).await
+        self.os.delete(location).await
     }
 
     fn delete_stream<'a>(&'a self, locations: futures_core::stream::BoxStream<'a, object_store::Result<Path>>) 
       -> futures_core::stream::BoxStream<'a, object_store::Result<Path>> {
-        self.fs.delete_stream(locations)
+        self.os.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> futures_core::stream::BoxStream<'_, object_store::Result<ObjectMeta>> {
-        self.fs.list(prefix)
+        self.os.list(prefix)
     }
 
     fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) 
       -> futures_core::stream::BoxStream<'_, object_store::Result<ObjectMeta>> {
-        self.fs.list_with_offset(prefix, offset)
+        self.os.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.fs.list_with_delimiter(prefix).await
+        self.os.list_with_delimiter(prefix).await
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.fs.copy(from, to).await
+        self.os.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.fs.rename(from, to).await
+        self.os.rename(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.fs.copy_if_not_exists(from, to).await
+        self.os.copy_if_not_exists(from, to).await
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.fs.rename_if_not_exists(from, to).await
+        self.os.rename_if_not_exists(from, to).await
     }
     
 }
