@@ -3,20 +3,21 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
-use cached::Cached;
 use deltalake::storage::object_store;
 use object_store::{ObjectStore, local::LocalFileSystem, PutPayload, PutResult,
                                        PutOptions, MultipartUpload, PutMultipartOpts, GetResult,
                                        GetOptions, ListResult, Attributes};
 use deltalake::{ObjectMeta, Path};
 use cocoon;
-use deltalake_core::storage::object_store::{GetResultPayload, UploadPart};
-use deltalake_core::storage::object_store::memory::InMemory;
+use deltalake_core::storage::object_store::{GetResultPayload, UploadPart, memory::InMemory};
 //use log::{info, trace, warn};
 use log::{warn};
 use show_bytes::show_bytes;
 use futures::{StreamExt};
+use cached::Cached;
 use cached::stores::SizedCache;
+use deltalake_core::DeltaTableError;
+use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
@@ -32,15 +33,46 @@ impl Display for CryptFileSystem {
 }
 
 impl CryptFileSystem {
+    pub fn object_store_from_uri(prefix_uri: impl AsRef<str>) -> object_store::Result<Arc<dyn ObjectStore>>{
+        let url = Url::parse(prefix_uri.as_ref());
+        if url.is_err() {
+            let msg = format!(
+                "Invalid URI: \"{}\" ",
+                prefix_uri.as_ref(),
+            );
+            return Err(object_store::Error::Generic {store: "CryptFileSystem", source: msg.into()});
+        }
 
-    /*
-    pub fn new() -> Self {
-        Self { fs: LocalFileSystem::new() }
+        let url = url.unwrap();
+        
+        match url.scheme(){
+            "file" => {
+                let path = url.to_file_path().map_err(|_| {
+                    let msg = format!(
+                        "URI Does not specify valid path \"{}\": ",
+                        prefix_uri.as_ref(),
+                    );
+                    object_store::Error::Generic {store: "CryptFileSystem", source: msg.into()}
+                })?;
+                Ok(Arc::new(LocalFileSystem::new_with_prefix(path)?))
+            },
+            "memory" => {
+                Ok(Arc::new(InMemory::new()))
+            },
+            _ => {
+                let msg = format!(
+                    "Unrecognized URI scheme \"{}\".",
+                    url.scheme(),
+                );
+                Err(object_store::Error::Generic { store: "CryptFileSystem", source: msg.into() })
+            }
+        }
+        
     }
-     */
 
-    pub fn new_with_prefix(prefix: impl AsRef<std::path::Path>, crypt_key: Vec<u8>) -> object_store::Result<Self> {
-        Ok(Self { os: Arc::new(LocalFileSystem::new_with_prefix(prefix)?) , crypt_key, 
+    pub fn new(prefix_uri: impl AsRef<str>, crypt_key: Vec<u8>) -> object_store::Result<Self> {
+        let os = CryptFileSystem::object_store_from_uri(prefix_uri)?;
+        Ok(Self { os , crypt_key, 
             decrypted_cache: Arc::new(Mutex::new(SizedCache::with_size(8)))})
     }
     
