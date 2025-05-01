@@ -25,7 +25,7 @@ mod crypt_fs;
 use crypt_fs::CryptFileSystem;
 // use log::{info, trace, warn};
 use log::{info};
-
+use crate::crypt_fs::KMS;
 
 fn get_table_columns() -> Vec<StructField> {
     vec![
@@ -110,7 +110,7 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     let path = "/home/cjoy/src/crypto-object-store/crypto-object-store/test_crypt";
     let joined = String::from("file://") + path;
     let table_uri = joined.as_str();
-    let file_store = Arc::new(CryptFileSystem::new(table_uri, Vec::from(b"password"))?); // Starting ObjectStore
+    let file_store = Arc::new(CryptFileSystem::new(table_uri, KMS::new(b"password"))?); // Starting ObjectStore
     // let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?); // Starting ObjectStore
 
     let _ = fs::remove_dir_all(path);

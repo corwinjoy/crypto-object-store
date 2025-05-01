@@ -16,23 +16,61 @@ use show_bytes::show_bytes;
 use futures::{StreamExt};
 use cached::Cached;
 use cached::stores::SizedCache;
-use deltalake_core::DeltaTableError;
 use url::Url;
+
+// A simple key management stub to associate path locations
+// with cryptography keys
+#[derive(Debug, Clone)]
+pub struct KMS {
+    crypt_key: Vec<u8>, // TODO: Key store here
+}
+
+impl Display for KMS {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "crypt_key: {}", show_bytes(self.crypt_key.clone()))
+    }
+}
+
+impl KMS {
+    pub fn new(crypt_key: &[u8]) -> Self {
+        KMS { crypt_key: Vec::from(crypt_key) }
+    }
+    
+    pub fn get_key(&self, location: &Path) -> Option<Vec<u8>> {
+        // process the path location to get the associated encryption key
+        // return None if there is no such associated key
+        
+        // As an example application, we leave the delta_log / metadata files unencrypted
+        if location.prefix_matches(&Path::from("/_delta_log")) {
+            return None;
+        }
+        
+        Some(self.crypt_key.clone())
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
     os: Arc<dyn ObjectStore>,
-    crypt_key: Vec<u8>, // TODO: Key store here
+    kms: KMS, // TODO: Key store here
     decrypted_cache: Arc<Mutex<SizedCache<Path, Vec<u8>>>>
 }
 
 impl Display for CryptFileSystem {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "os: {}, crypt_key: {}", self.os, show_bytes(self.crypt_key.clone()))
+        write!(f, "os: {}, kms: {}", self.os, self.kms)
     }
 }
 
 impl CryptFileSystem {
+    pub fn new(prefix_uri: impl AsRef<str>, crypt_key: KMS) -> object_store::Result<Self> {
+        let os = CryptFileSystem::object_store_from_uri(prefix_uri)?;
+        Ok(Self { os ,
+            kms: crypt_key, 
+            decrypted_cache: Arc::new(Mutex::new(SizedCache::with_size(8)))})
+    }
+
     pub fn object_store_from_uri(prefix_uri: impl AsRef<str>) -> object_store::Result<Arc<dyn ObjectStore>>{
         let url = Url::parse(prefix_uri.as_ref());
         if url.is_err() {
@@ -44,7 +82,7 @@ impl CryptFileSystem {
         }
 
         let url = url.unwrap();
-        
+
         match url.scheme(){
             "file" => {
                 let path = url.to_file_path().map_err(|_| {
@@ -67,13 +105,7 @@ impl CryptFileSystem {
                 Err(object_store::Error::Generic { store: "CryptFileSystem", source: msg.into() })
             }
         }
-        
-    }
 
-    pub fn new(prefix_uri: impl AsRef<str>, crypt_key: Vec<u8>) -> object_store::Result<Self> {
-        let os = CryptFileSystem::object_store_from_uri(prefix_uri)?;
-        Ok(Self { os , crypt_key, 
-            decrypted_cache: Arc::new(Mutex::new(SizedCache::with_size(8)))})
     }
     
     // Add decrypted data to cache
@@ -88,23 +120,27 @@ impl CryptFileSystem {
         dc.cache_get(location).map(Vec::clone)
     }
 
-    pub fn encrypt(&self, _location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let mut cocoon = cocoon::Cocoon::new(self.crypt_key.as_slice());
-        let encrypted = cocoon.wrap(data);
-        if encrypted.is_err() {
-            return Err(format!("cocoon encryption error {:?}", encrypted).into())
-        };
-        Ok(encrypted.unwrap())
+    pub fn encrypt(&self, location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let key = self.kms.get_key(location);
+        if key.is_none() {
+            // No encryption
+            return Ok(Vec::from(data));
+        }
+        let key = key.unwrap();
+        let mut cocoon = cocoon::Cocoon::new(key.as_slice());
+        let encrypted = cocoon.wrap(data)?;
+        Ok(encrypted)
     }
 
-    pub fn decrypt(&self, _location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let cocoon = cocoon::Cocoon::new(self.crypt_key.as_slice());
-        let decrypted = cocoon.unwrap(data);
-        if decrypted.is_err() {
-            return Err(format!("cocoon decryption error {:?}", decrypted).into())
-        };
-
-        let decrypted = decrypted.unwrap();
+    pub fn decrypt(&self, location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let key = self.kms.get_key(location);
+        if key.is_none() {
+            // No encryption
+            return Ok(Vec::from(data));
+        }
+        let key = key.unwrap();
+        let cocoon = cocoon::Cocoon::new(key.as_slice());
+        let decrypted = cocoon.unwrap(data)?;
         Ok(decrypted)
     }
 
@@ -128,9 +164,8 @@ impl CryptFileSystem {
     }
 
     async fn encrypted_payloads(&self, location: &Path, payloads: &Vec<PutPayload>) -> object_store::Result<PutPayload> {
-        // Eventually, we can hopefully do this block-wise by using payload.to_iter()
-
         // Buffer the payload in memory
+        // Eventually, we can maybe do this block-wise by using payload.to_iter()
         let ms = InMemory::new();
         let tmp = Path::from("tmp");
         for payload in payloads {
@@ -139,6 +174,8 @@ impl CryptFileSystem {
 
         let result: GetResult = ms.get(&tmp).await?;
         let bytes = result.bytes().await?;
+        
+        // Cache unencrypted file
         self.set_cache(location, bytes.to_vec());
 
         // Encrypt
@@ -153,8 +190,6 @@ impl CryptFileSystem {
     }
 
     async fn decrypted_get_result(&self, location: &Path, gr: GetResult) -> object_store::Result<GetResult> {
-        // Eventually, we can hopefully do this block-wise by using payload.to_iter()
-
         let meta = gr.meta.clone();
         let range = gr.range.clone();
         let attributes = gr.attributes.clone();
@@ -272,39 +307,9 @@ impl ObjectStore for CryptFileSystem {
             .collect()
     }
 
-    /*
-     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
-        let path = self.path_to_filesystem(location)?;
-        let ranges = ranges.to_vec();
-        maybe_spawn_blocking(move || {
-            // Vectored IO might be faster
-            let (mut file, _) = open_file(&path)?;
-            ranges
-                .into_iter()
-                .map(|r| read_range(&mut file, &path, r))
-                .collect()
-        })
-        .await
-    }
-
-     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
-        let entry = self.entry(location).await?;
-        ranges
-            .iter()
-            .map(|range| {
-                let r = GetRange::Bounded(range.clone())
-                    .as_range(entry.data.len())
-                    .context(RangeSnafu)?;
-
-                Ok(entry.data.slice(r))
-            })
-            .collect()
-    }
-     */
-
     ////////////////////////////////////////////////////////////////////////////////////
     // The rest of these functions operate at the file system level and should all
-    // be just pass throughs
+    // be just pass-throughs
     ////////////////////////////////////////////////////////////////////////////////////
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         self.os.head(location).await
@@ -347,5 +352,4 @@ impl ObjectStore for CryptFileSystem {
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
         self.os.rename_if_not_exists(from, to).await
     }
-    
 }

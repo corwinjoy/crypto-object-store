@@ -13,7 +13,7 @@ bytes = "1.10.1"
 futures-core = "0.3.31"
 log = "0.4.27"
 simple-logging = "2.0.2"
-cocoon ="0.4.3"
+cocoon = { version = "0.4.3", features = ["std", "thiserror"]}
 show-bytes = "0.2.0"
 futures = "0.3.31"
 cached = "0.55.1"
