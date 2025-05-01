@@ -22,6 +22,7 @@ use url::Url;
 // with cryptography keys
 #[derive(Debug, Clone)]
 pub struct KMS {
+    /// Encryption key
     crypt_key: Vec<u8>, // TODO: A fancy key lookup here
 }
 
@@ -52,8 +53,13 @@ impl KMS {
 
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
+    /// The underlying object store
     os: Arc<dyn ObjectStore>,
+    
+    /// Class to associate path locations with encryption keys
     kms: KMS, 
+    
+    /// Cache for decrypted files
     decrypted_cache: Arc<Mutex<SizedCache<Path, Vec<u8>>>>
 }
 
@@ -64,10 +70,9 @@ impl Display for CryptFileSystem {
 }
 
 impl CryptFileSystem {
-    pub fn new(prefix_uri: impl AsRef<str>, crypt_key: KMS) -> object_store::Result<Self> {
+    pub fn new(prefix_uri: impl AsRef<str>, kms: KMS) -> object_store::Result<Self> {
         let os = CryptFileSystem::object_store_from_uri(prefix_uri)?;
-        Ok(Self { os ,
-            kms: crypt_key, 
+        Ok(Self { os , kms, 
             decrypted_cache: Arc::new(Mutex::new(SizedCache::with_size(8)))})
     }
 
@@ -309,7 +314,7 @@ impl ObjectStore for CryptFileSystem {
 
     ////////////////////////////////////////////////////////////////////////////////////
     // The rest of these functions operate at the file system level and should all
-    // be just pass-throughs
+    // be just pass-through
     ////////////////////////////////////////////////////////////////////////////////////
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         self.os.head(location).await
