@@ -261,48 +261,48 @@ impl MultipartUpload for CryptUpload {
 #[async_trait]
 impl ObjectStore for CryptFileSystem {
     async fn put(&self, location: &Path, payload: PutPayload) -> object_store::Result<PutResult> {
-        warn!("put");
+        warn!("put: {location}");
         let encrypted_payload = self.encrypted_payload(location, payload).await?;
         self.os.put(location, encrypted_payload).await
     }
     
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
-        warn!("put_opts");
+        warn!("put_opts: {location}");
         let encrypted_payload = self.encrypted_payload(location, payload).await?;
         self.os.put_opts(location, encrypted_payload, opts).await
     }
 
     async fn put_multipart(&self, location: &Path) -> object_store::Result<Box<dyn MultipartUpload>>{
-        warn!("put_multipart");
+        warn!("put_multipart: {location}");
         Ok(Box::new(CryptUpload::new(location.clone(), &self)))
     }
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload>> {
-        warn!("put_multipart_opts");
+        warn!("put_multipart_opts: {location}");
         Ok(Box::new(CryptUpload::new_with_attributes(location.clone(), &self, opts.attributes.clone())))
     }
 
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
-        warn!("get");
+        warn!("get: {location}");
         let gr = self.os.get(location).await?;
         self.decrypted_get_result(location, gr).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
-        warn!("get_opts");
+        warn!("get_opts: {location}");
         let gr = self.os.get_opts(location, options).await?;
         self.decrypted_get_result(location, gr).await
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
-        warn!("get_range");
+        warn!("get_range: {location}");
         let gr = self.os.get(location).await?;
         let db = self.decrypted_bytes(location, gr).await?;
         Ok(db.slice(range))
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> object_store::Result<Vec<Bytes>> {
-        warn!("get_ranges");
+        warn!("get_ranges: {location}");
         let gr = self.os.get(location).await?;
         let db = self.decrypted_bytes(location, gr).await?;
         let ranges = ranges.to_vec();
