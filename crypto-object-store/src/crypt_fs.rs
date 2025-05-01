@@ -56,9 +56,7 @@ impl CryptFileSystem {
         dc.cache_get(location).map(Vec::clone)
     }
 
-    pub fn encrypt(&self, location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        self.set_cache(location, data.to_vec());
-        
+    pub fn encrypt(&self, _location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut cocoon = cocoon::Cocoon::new(self.crypt_key.as_slice());
         let encrypted = cocoon.wrap(data);
         if encrypted.is_err() {
@@ -67,7 +65,7 @@ impl CryptFileSystem {
         Ok(encrypted.unwrap())
     }
 
-    pub fn decrypt(&self, location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn decrypt(&self, _location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let cocoon = cocoon::Cocoon::new(self.crypt_key.as_slice());
         let decrypted = cocoon.unwrap(data);
         if decrypted.is_err() {
@@ -75,8 +73,26 @@ impl CryptFileSystem {
         };
 
         let decrypted = decrypted.unwrap();
-        self.set_cache(location, data.to_vec());
         Ok(decrypted)
+    }
+
+    async fn decrypted_bytes(&self, location: &Path, gr: GetResult) -> Result<Bytes, object_store::Error> {
+        // Check cache
+        let cache = self.get_cache(location);
+        if cache.is_some() {
+            return Ok(Bytes::from(cache.unwrap().clone()));
+        }
+
+        // Buffer the payload in memory
+        let bytes = gr.bytes().await?;
+
+        // Decrypt
+        let decrypted = self.decrypt(location, &*bytes).unwrap();
+        self.set_cache(location, decrypted.clone());
+        
+        // Convert to bytes
+        let db = Bytes::from(decrypted);
+        Ok(db)
     }
 
     async fn encrypted_payloads(&self, location: &Path, payloads: &Vec<PutPayload>) -> object_store::Result<PutPayload> {
@@ -91,6 +107,7 @@ impl CryptFileSystem {
 
         let result: GetResult = ms.get(&tmp).await?;
         let bytes = result.bytes().await?;
+        self.set_cache(location, bytes.to_vec());
 
         // Encrypt
         let encrypted = self.encrypt(location, &*bytes).unwrap();
@@ -117,21 +134,7 @@ impl CryptFileSystem {
             meta, range, attributes,
         })
     }
-
-    async fn decrypted_bytes(&self, location: &Path, gr: GetResult) -> Result<Bytes, object_store::Error> {
-        let cache = self.get_cache(location);
-        if cache.is_some() {
-            return Ok(Bytes::from(cache.unwrap().clone()));
-        }
-
-        // Buffer the payload in memory
-        let bytes = gr.bytes().await?;
-
-        // Decrypt
-        let decrypted = self.decrypt(location, &*bytes).unwrap();
-        let db = Bytes::from(decrypted);
-        Ok(db)
-    }
+    
 }
 
 #[derive(Debug)]
