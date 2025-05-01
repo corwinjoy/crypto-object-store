@@ -1,8 +1,9 @@
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
+use cached::Cached;
 use deltalake::storage::object_store;
 use object_store::{ObjectStore, local::LocalFileSystem, PutPayload, PutResult,
                                        PutOptions, MultipartUpload, PutMultipartOpts, GetResult,
@@ -15,11 +16,13 @@ use deltalake_core::storage::object_store::memory::InMemory;
 use log::{warn};
 use show_bytes::show_bytes;
 use futures::{StreamExt};
+use cached::stores::SizedCache;
 
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
     os: Arc<dyn ObjectStore>,
-    crypt_key: Vec<u8>,
+    crypt_key: Vec<u8>, // TODO: Key store here
+    decrypted_cache: Arc<Mutex<SizedCache<Path, Vec<u8>>>>
 }
 
 impl Display for CryptFileSystem {
@@ -37,10 +40,25 @@ impl CryptFileSystem {
      */
 
     pub fn new_with_prefix(prefix: impl AsRef<std::path::Path>, crypt_key: Vec<u8>) -> object_store::Result<Self> {
-        Ok(Self { os: Arc::new(LocalFileSystem::new_with_prefix(prefix)?) , crypt_key})
+        Ok(Self { os: Arc::new(LocalFileSystem::new_with_prefix(prefix)?) , crypt_key, 
+            decrypted_cache: Arc::new(Mutex::new(SizedCache::with_size(8)))})
+    }
+    
+    // Add decrypted data to cache
+    fn set_cache(&self, location: &Path, data: Vec<u8>) {
+        let mut dc = self.decrypted_cache.lock().unwrap();
+        dc.cache_set(location.clone(), data);
+    }
+    
+    // Check cache for decrypted data
+    fn get_cache(&self, location: &Path) -> Option<Vec<u8>> {
+        let mut dc = self.decrypted_cache.lock().unwrap();
+        dc.cache_get(location).map(Vec::clone)
     }
 
-    pub fn encrypt(&self, _location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn encrypt(&self, location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.set_cache(location, data.to_vec());
+        
         let mut cocoon = cocoon::Cocoon::new(self.crypt_key.as_slice());
         let encrypted = cocoon.wrap(data);
         if encrypted.is_err() {
@@ -49,13 +67,16 @@ impl CryptFileSystem {
         Ok(encrypted.unwrap())
     }
 
-    pub fn decrypt(&self, _location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn decrypt(&self, location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let cocoon = cocoon::Cocoon::new(self.crypt_key.as_slice());
         let decrypted = cocoon.unwrap(data);
         if decrypted.is_err() {
             return Err(format!("cocoon decryption error {:?}", decrypted).into())
         };
-        Ok(decrypted.unwrap())
+
+        let decrypted = decrypted.unwrap();
+        self.set_cache(location, data.to_vec());
+        Ok(decrypted)
     }
 
     async fn encrypted_payloads(&self, location: &Path, payloads: &Vec<PutPayload>) -> object_store::Result<PutPayload> {
@@ -67,7 +88,7 @@ impl CryptFileSystem {
         for payload in payloads {
             ms.put(&tmp, payload.clone()).await?;
         }
-        
+
         let result: GetResult = ms.get(&tmp).await?;
         let bytes = result.bytes().await?;
 
@@ -98,6 +119,11 @@ impl CryptFileSystem {
     }
 
     async fn decrypted_bytes(&self, location: &Path, gr: GetResult) -> Result<Bytes, object_store::Error> {
+        let cache = self.get_cache(location);
+        if cache.is_some() {
+            return Ok(Bytes::from(cache.unwrap().clone()));
+        }
+
         // Buffer the payload in memory
         let bytes = gr.bytes().await?;
 
@@ -112,13 +138,13 @@ impl CryptFileSystem {
 pub struct CryptUpload {
     /// The final destination
     dest: Path,
-    
+
     /// Associated encrypted store
     cfs: CryptFileSystem,
-    
+
     /// Vector of payloads to write
     parts: Vec<PutPayload>,
-    
+
     /// Write attributes
     attributes: Attributes,
 }
@@ -146,7 +172,7 @@ impl MultipartUpload for CryptUpload {
         if self.attributes.is_empty() {
             return self.cfs.os.put(&self.dest, encrypted_payload).await
         }
-        
+
         let opts : PutOptions = self.attributes.clone().into();
         self.cfs.os.put_opts(&self.dest, encrypted_payload, opts).await
     }
