@@ -22,7 +22,7 @@ use url::Url;
 // with cryptography keys
 #[derive(Debug, Clone)]
 pub struct KMS {
-    crypt_key: Vec<u8>, // TODO: Key store here
+    crypt_key: Vec<u8>, // TODO: A fancy key lookup here
 }
 
 impl Display for KMS {
@@ -53,7 +53,7 @@ impl KMS {
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
     os: Arc<dyn ObjectStore>,
-    kms: KMS, // TODO: Key store here
+    kms: KMS, 
     decrypted_cache: Arc<Mutex<SizedCache<Path, Vec<u8>>>>
 }
 
