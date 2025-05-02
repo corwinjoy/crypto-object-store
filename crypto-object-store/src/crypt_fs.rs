@@ -59,6 +59,31 @@ impl GetCryptKey for KMS {
 }
 
 
+// A KMS that disables encryption for basic tests
+#[derive(Debug, Clone)]
+pub struct KmsNone {
+}
+
+impl KmsNone {
+    pub fn new() -> Self {
+        KmsNone { }
+    }
+}
+
+impl Display for KmsNone {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KmsNone")
+    }
+}
+
+impl GetCryptKey for KmsNone {
+    fn get_key(&self, _location: &Path) -> Option<Vec<u8>> {
+        return None;
+    }
+}
+
+
+
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
     /// The underlying object store
@@ -145,7 +170,8 @@ impl CryptFileSystem {
             return Ok(Vec::from(data));
         }
         let key = key.unwrap();
-        let mut cocoon = cocoon::Cocoon::new(key.as_slice());
+        let mut cocoon = cocoon::Cocoon::new(key.as_slice())
+            .with_cipher(cocoon::CocoonCipher::Aes256Gcm);
         let encrypted = cocoon.wrap(data)?;
         Ok(encrypted)
     }
@@ -157,7 +183,8 @@ impl CryptFileSystem {
             return Ok(Vec::from(data));
         }
         let key = key.unwrap();
-        let cocoon = cocoon::Cocoon::new(key.as_slice());
+        let cocoon = cocoon::Cocoon::new(key.as_slice())
+            .with_cipher(cocoon::CocoonCipher::Aes256Gcm);
         let decrypted = cocoon.unwrap(data)?;
         Ok(decrypted)
     }
@@ -448,30 +475,7 @@ mod tests {
     use object_store_std::integration::*;
     use rand::{rng, Rng};
     use super::*;
-
-    // A KMS that disables encryption for basic tests
-    #[derive(Debug, Clone)]
-    pub struct KmsNone {
-    }
-
-    impl KmsNone {
-        pub fn new() -> Self {
-            KmsNone { }
-        }
-    }
-
-    impl Display for KmsNone {
-        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            write!(f, "KmsNone")
-        }
-    }
-
-    impl GetCryptKey for KmsNone {
-        fn get_key(&self, _location: &Path) -> Option<Vec<u8>> {
-            return None;
-        }
-    }
-
+    
     /// Returns a chunk of length `chunk_length`
     fn get_chunk(chunk_length: usize) -> Bytes {
         let mut data = vec![0_u8; chunk_length];

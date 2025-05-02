@@ -3,7 +3,7 @@ Simple deltalake example using custom ObjectStore.
 Adapted from delta-rs/crates/deltalake/examples/basic_operations.rs
 */
 
-use std::fs;
+use std::{env, fs};
 use deltalake::arrow::{
     array::{Int32Array, StringArray, TimestampMicrosecondArray},
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
@@ -18,6 +18,7 @@ use deltalake::parquet::{
 use deltalake::{protocol::SaveMode, DeltaOps};
 
 use std::sync::Arc;
+use std::time::SystemTime;
 use deltalake_core::{DeltaTableBuilder, DeltaTableError};
 // use deltalake::storage::object_store::local::LocalFileSystem;
 use url::Url;
@@ -25,7 +26,9 @@ mod crypt_fs;
 use crypt_fs::CryptFileSystem;
 // use log::{info, trace, warn};
 use log::{info};
-use crate::crypt_fs::KMS;
+use object_store_std::DynObjectStore;
+use object_store_std::local::LocalFileSystem;
+use crate::crypt_fs::{KmsNone, KMS};
 
 fn get_table_columns() -> Vec<StructField> {
     vec![
@@ -105,15 +108,44 @@ fn get_table_batches() -> RecordBatch {
 async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     use log::LevelFilter;
     simple_logging::log_to_file("crypt_fs.log", LevelFilter::Trace)?;
-    
-    // Create a delta operations client pointing at an un-initialized location.
-    let path = "/home/cjoy/src/crypto-object-store/crypto-object-store/test_crypt";
+
+    let workdir = env::current_dir()?;
+    let dir = "/test_crypt";
+    let path = String::from(workdir.to_str().unwrap()) + dir;
+    let path = path.as_str();
     let joined = String::from("file://") + path;
     let table_uri = joined.as_str();
     let kms = Arc::new(KMS::new(b"password"));
-    let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?); 
-    // let encrypted_file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?); 
+    // let kms = Arc::new(KmsNone::new());
+    let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?);
+    timed_delta_table_read_write(path, table_uri, encrypted_file_store).await.expect("Error in encrypted read/write");
+    
+    let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
+    timed_delta_table_read_write(path, table_uri, file_store).await.expect("Error in encrypted read/write");
+    Ok(())
+}
 
+async fn timed_delta_table_read_write(path: &str, table_uri: &str, object_store: Arc<DynObjectStore>) -> Result<(), deltalake::errors::DeltaTableError> {
+    let now = SystemTime::now();
+
+    delta_table_read_write(path, table_uri, object_store).await??;
+
+    println!("\n****************************************************************************\n");
+    match now.elapsed() {
+        Ok(elapsed) => {
+            println!("Delta Table Read/Write time: {}ms", elapsed.as_millis());
+        }
+        Err(e) => {
+            // an error occurred!
+            println!("Timer Error: {e:?}");
+        }
+    }
+    println!("\n****************************************************************************\n");
+    
+    Ok(())
+}
+
+async fn delta_table_read_write(path: &str, table_uri: &str, object_store: Arc<DynObjectStore>) -> Result<Result<(), DeltaTableError>, DeltaTableError> {
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
 
@@ -121,12 +153,12 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
 
     let mut table = DeltaTableBuilder::from_valid_uri(table_uri)
         .unwrap()
-        .with_storage_backend(encrypted_file_store, Url::parse(table_uri).unwrap())
+        .with_storage_backend(object_store, Url::parse(table_uri).unwrap())
         .build()?;
 
     info!("finish DeltaTableBuilder::build");
 
-
+    // Create a delta operations client pointing at an un-initialized location.
     // We allow for uninitialized locations, since we may want to create the table
     info!("start table.load");
     let ops: DeltaOps = match table.load().await {
@@ -187,6 +219,6 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
 
     println!("{data:?}");
 
-    Ok(())
+    Ok(Ok(()))
 }
 
