@@ -3,7 +3,6 @@ Simple deltalake example using custom ObjectStore.
 Adapted from delta-rs/crates/deltalake/examples/basic_operations.rs
 */
 
-use std::{env, fs};
 use deltalake::arrow::{
     array::{Int32Array, StringArray, TimestampMicrosecondArray},
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
@@ -15,20 +14,21 @@ use deltalake::parquet::{
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
-use deltalake::{protocol::SaveMode, DeltaOps};
+use deltalake::{DeltaOps, protocol::SaveMode};
+use std::{env, fs};
 
+use deltalake_core::{DeltaTableBuilder, DeltaTableError};
 use std::sync::Arc;
 use std::time::SystemTime;
-use deltalake_core::{DeltaTableBuilder, DeltaTableError};
 // use deltalake::storage::object_store::local::LocalFileSystem;
 use url::Url;
 mod crypt_fs;
 use crypt_fs::CryptFileSystem;
 // use log::{info, trace, warn};
-use log::{info};
+use crate::crypt_fs::{KMS, KmsNone};
+use log::info;
 use object_store_std::DynObjectStore;
 use object_store_std::local::LocalFileSystem;
-use crate::crypt_fs::{KmsNone, KMS};
 
 fn get_table_columns() -> Vec<StructField> {
     vec![
@@ -75,34 +75,34 @@ fn get_table_batches() -> RecordBatch {
             Arc::new(ts_values),
         ],
     )
-        .unwrap()
+    .unwrap()
 }
 
 /*
-    async fn test_peek_with_invalid_json() -> DeltaResult<()> {
-        use crate::logstore::object_store::memory::InMemory;
-        let memory_store = Arc::new(InMemory::new());
-        let log_path = Path::from("delta-table/_delta_log/00000000000000000001.json");
+   async fn test_peek_with_invalid_json() -> DeltaResult<()> {
+       use crate::logstore::object_store::memory::InMemory;
+       let memory_store = Arc::new(InMemory::new());
+       let log_path = Path::from("delta-table/_delta_log/00000000000000000001.json");
 
-        let log_content = r#"{invalid_json"#;
+       let log_content = r#"{invalid_json"#;
 
-        memory_store
-            .put(&log_path, log_content.into())
-            .await
-            .expect("Failed to write log file");
+       memory_store
+           .put(&log_path, log_content.into())
+           .await
+           .expect("Failed to write log file");
 
-        let table_uri = "memory:///delta-table";
+       let table_uri = "memory:///delta-table";
 
-        let table = crate::DeltaTableBuilder::from_valid_uri(table_uri)
-            .unwrap()
-            .with_storage_backend(memory_store, Url::parse(table_uri).unwrap())
-            .build()?;
+       let table = crate::DeltaTableBuilder::from_valid_uri(table_uri)
+           .unwrap()
+           .with_storage_backend(memory_store, Url::parse(table_uri).unwrap())
+           .build()?;
 
-        let result = table.log_store().peek_next_commit(0).await;
-        assert!(result.is_err());
-        Ok(())
-    }
- */
+       let result = table.log_store().peek_next_commit(0).await;
+       assert!(result.is_err());
+       Ok(())
+   }
+*/
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
@@ -115,17 +115,32 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     let path = path.as_str();
     let joined = String::from("file://") + path;
     let table_uri = joined.as_str();
-    let kms = Arc::new(KMS::new(b"password"));
-    // let kms = Arc::new(KmsNone::new());
-    let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?);
-    timed_delta_table_read_write(path, table_uri, encrypted_file_store).await.expect("Error in encrypted read/write");
     
+    let kms = Arc::new(KmsNone::new());
+    let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?);
+    timed_delta_table_read_write("ObjectStore with **NO** Encryption", path, table_uri, encrypted_file_store)
+        .await
+        .expect("Error in encrypted read/write");
+
+    let kms = Arc::new(KMS::new(b"password"));
+    let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?);
+    timed_delta_table_read_write("ObjectStore with Encryption", path, table_uri, encrypted_file_store)
+        .await
+        .expect("Error in encrypted read/write");
+
     let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
-    timed_delta_table_read_write(path, table_uri, file_store).await.expect("Error in encrypted read/write");
+    timed_delta_table_read_write("Raw LocalFileSystem", path, table_uri, file_store)
+        .await
+        .expect("Error in encrypted read/write");
     Ok(())
 }
 
-async fn timed_delta_table_read_write(path: &str, table_uri: &str, object_store: Arc<DynObjectStore>) -> Result<(), deltalake::errors::DeltaTableError> {
+async fn timed_delta_table_read_write(
+    label: &str,
+    path: &str,
+    table_uri: &str,
+    object_store: Arc<DynObjectStore>,
+) -> Result<(), deltalake::errors::DeltaTableError> {
     let now = SystemTime::now();
 
     delta_table_read_write(path, table_uri, object_store).await??;
@@ -133,7 +148,7 @@ async fn timed_delta_table_read_write(path: &str, table_uri: &str, object_store:
     println!("\n****************************************************************************\n");
     match now.elapsed() {
         Ok(elapsed) => {
-            println!("Delta Table Read/Write time: {}ms", elapsed.as_millis());
+            println!("{} time: {}ms", label, elapsed.as_millis());
         }
         Err(e) => {
             // an error occurred!
@@ -141,11 +156,15 @@ async fn timed_delta_table_read_write(path: &str, table_uri: &str, object_store:
         }
     }
     println!("\n****************************************************************************\n");
-    
+
     Ok(())
 }
 
-async fn delta_table_read_write(path: &str, table_uri: &str, object_store: Arc<DynObjectStore>) -> Result<Result<(), DeltaTableError>, DeltaTableError> {
+async fn delta_table_read_write(
+    path: &str,
+    table_uri: &str,
+    object_store: Arc<DynObjectStore>,
+) -> Result<Result<(), DeltaTableError>, DeltaTableError> {
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
 
@@ -221,4 +240,3 @@ async fn delta_table_read_write(path: &str, table_uri: &str, object_store: Arc<D
 
     Ok(Ok(()))
 }
-
