@@ -110,7 +110,8 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     let path = "/home/cjoy/src/crypto-object-store/crypto-object-store/test_crypt";
     let joined = String::from("file://") + path;
     let table_uri = joined.as_str();
-    let file_store = Arc::new(CryptFileSystem::new(table_uri, KMS::new(b"password"))?); // Starting ObjectStore
+    let kms = Arc::new(KMS::new(b"password"));
+    let file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?); // Starting ObjectStore
     // let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?); // Starting ObjectStore
 
     let _ = fs::remove_dir_all(path);

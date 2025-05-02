@@ -1,5 +1,5 @@
-use std::fmt::{Display, Formatter};
-use std::ops::Range;
+use std::fmt::{Display, Formatter, Debug};
+use std::ops::{Bound, Range, RangeBounds};
 use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,7 +16,12 @@ use show_bytes::show_bytes;
 use futures::{StreamExt};
 use cached::Cached;
 use cached::stores::SizedCache;
+use object_store_std::multipart::{MultipartStore, PartId};
 use url::Url;
+
+pub trait GetCryptKey: Display + Send + Sync + Debug {
+    fn get_key(&self, location: &Path) -> Option<Vec<u8>>;
+}
 
 // A simple key management stub to associate path locations
 // with cryptography keys
@@ -26,18 +31,21 @@ pub struct KMS {
     crypt_key: Vec<u8>, // TODO: A fancy key lookup here
 }
 
+impl KMS {
+    pub fn new(crypt_key: &[u8]) -> Self {
+        KMS { crypt_key: Vec::from(crypt_key) }
+    }
+}
+
 impl Display for KMS {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "crypt_key: {}", show_bytes(self.crypt_key.clone()))
     }
 }
 
-impl KMS {
-    pub fn new(crypt_key: &[u8]) -> Self {
-        KMS { crypt_key: Vec::from(crypt_key) }
-    }
-    
-    pub fn get_key(&self, location: &Path) -> Option<Vec<u8>> {
+
+impl GetCryptKey for KMS {
+    fn get_key(&self, location: &Path) -> Option<Vec<u8>> {
         // process the path location to get the associated encryption key
         // return None if there is no such associated key
         
@@ -57,7 +65,7 @@ pub struct CryptFileSystem {
     os: Arc<dyn ObjectStore>,
     
     /// Class to associate path locations with encryption keys
-    kms: KMS, 
+    kms: Arc<dyn GetCryptKey>, 
     
     /// Cache for decrypted files
     decrypted_cache: Arc<Mutex<SizedCache<Path, Vec<u8>>>>
@@ -70,9 +78,9 @@ impl Display for CryptFileSystem {
 }
 
 impl CryptFileSystem {
-    pub fn new(prefix_uri: impl AsRef<str>, kms: KMS) -> object_store::Result<Self> {
+    pub fn new(prefix_uri: impl AsRef<str>, kms: Arc<dyn GetCryptKey>) -> object_store::Result<Self> {
         let os = CryptFileSystem::object_store_from_uri(prefix_uri)?;
-        Ok(Self { os , kms, 
+        Ok(Self { os , kms: kms.clone(), 
             decrypted_cache: Arc::new(Mutex::new(SizedCache::with_size(8)))})
     }
 
@@ -124,6 +132,11 @@ impl CryptFileSystem {
         let mut dc = self.decrypted_cache.lock().unwrap();
         dc.cache_get(location).map(Vec::clone)
     }
+    
+    fn clear_cache(&self) {
+        let mut dc = self.decrypted_cache.lock().unwrap();
+        dc.cache_clear();
+    }
 
     pub fn encrypt(&self, location: &Path, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let key = self.kms.get_key(location);
@@ -149,19 +162,63 @@ impl CryptFileSystem {
         Ok(decrypted)
     }
 
+
+    pub fn check_bytes_slice(len: usize, range: impl RangeBounds<usize>) -> Result<(), object_store::Error> {
+        use core::ops::Bound;
+        
+        let begin = match range.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n.checked_add(1).expect("out of range"),
+            Bound::Unbounded => 0,
+        };
+
+        let end = match range.end_bound() {
+            Bound::Included(&n) => n.checked_add(1).expect("out of range"),
+            Bound::Excluded(&n) => n,
+            Bound::Unbounded => len,
+        };
+
+        if begin > end {
+            let msg = format!(
+                "Range start must not be greater than end: [{}..{}] ",
+                begin, end,
+            );
+            return Err(object_store::Error::Generic { store: "CryptFileSystem", source: msg.into()});
+        }
+
+        if end > len {
+            let msg = format!(
+                "Range end out of bounds: [{}..{}] ",
+                begin, end,
+            );
+            return Err(object_store::Error::Generic { store: "CryptFileSystem", source: msg.into()});
+        }
+        
+        Ok(())
+    }
+    
     async fn decrypted_bytes(&self, location: &Path, gr: GetResult) -> Result<Bytes, object_store::Error> {
         // Check cache
         let cache = self.get_cache(location);
         if cache.is_some() {
-            return Ok(Bytes::from(cache.unwrap().clone()));
+            let r = gr.range.clone();
+            let v = cache.unwrap();
+            CryptFileSystem::check_bytes_slice(v.len(), r.clone())?;
+            let bytes = Bytes::from(Vec::from(v));
+            return Ok(bytes.slice(r));
         }
 
         // Buffer the payload in memory
+        let gr_range = gr.range.clone();
         let bytes = gr.bytes().await?;
 
         // Decrypt
         let decrypted = self.decrypt(location, &*bytes).unwrap();
-        self.set_cache(location, decrypted.clone());
+        if gr_range.start_bound() == Bound::Unbounded && gr_range.end_bound() == Bound::Unbounded {
+            // Only cache full get
+            self.set_cache(location, decrypted.clone());
+        }
+        
         
         // Convert to bytes
         let db = Bytes::from(decrypted);
@@ -173,15 +230,20 @@ impl CryptFileSystem {
         // Eventually, we can maybe do this block-wise by using payload.to_iter()
         let ms = InMemory::new();
         let tmp = Path::from("tmp");
-        for payload in payloads {
-            ms.put(&tmp, payload.clone()).await?;
+        let mid = ms.create_multipart(&tmp).await?;
+        let mut parts: Vec<PartId> = Vec::new();
+        for (idx, payload) in payloads.iter().enumerate() {
+            let part_id: PartId = ms.put_part(&tmp, &mid, idx, payload.clone()).await?;
+            parts.push(part_id);
         }
+        ms.complete_multipart(&tmp, &mid, parts).await?;
 
         let result: GetResult = ms.get(&tmp).await?;
         let bytes = result.bytes().await?;
         
-        // Cache unencrypted file
-        self.set_cache(location, bytes.to_vec());
+        // Only cache on get because write to underlying system
+        // may fail.
+        // self.set_cache(location, bytes.to_vec());
 
         // Encrypt
         let encrypted = self.encrypt(location, &*bytes).unwrap();
@@ -298,6 +360,7 @@ impl ObjectStore for CryptFileSystem {
         warn!("get_range: {location}");
         let gr = self.os.get(location).await?;
         let db = self.decrypted_bytes(location, gr).await?;
+        CryptFileSystem::check_bytes_slice(db.len(), range.clone())?;
         Ok(db.slice(range))
     }
 
@@ -321,11 +384,13 @@ impl ObjectStore for CryptFileSystem {
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.clear_cache();
         self.os.delete(location).await
     }
 
     fn delete_stream<'a>(&'a self, locations: futures_core::stream::BoxStream<'a, object_store::Result<Path>>) 
       -> futures_core::stream::BoxStream<'a, object_store::Result<Path>> {
+        self.clear_cache();
         self.os.delete_stream(locations)
     }
 
@@ -343,10 +408,12 @@ impl ObjectStore for CryptFileSystem {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.clear_cache();
         self.os.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.clear_cache();
         self.os.rename(from, to).await
     }
 
@@ -355,6 +422,57 @@ impl ObjectStore for CryptFileSystem {
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.clear_cache();
         self.os.rename_if_not_exists(from, to).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store_std::integration::*;
+    use super::*;
+
+    // A KMS that disables encryption for basic tests
+    #[derive(Debug, Clone)]
+    pub struct KmsNone {
+        /// Encryption key
+        crypt_key: Vec<u8>, // TODO: A fancy key lookup here
+    }
+
+    impl KmsNone {
+        pub fn new() -> Self {
+            KmsNone { crypt_key: Vec::from("") }
+        }
+    }
+
+    impl Display for KmsNone {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "crypt_key: {}", show_bytes(self.crypt_key.clone()))
+        }
+    }
+
+    impl GetCryptKey for KmsNone {
+        fn get_key(&self, _location: &Path) -> Option<Vec<u8>> {
+            return None;
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_test() {
+        // let integration = InMemory::new();
+        let kms = Arc::new(KmsNone::new());
+        let integration: Box<dyn ObjectStore> = 
+            Box::new(CryptFileSystem::new("memory://", kms).unwrap());
+
+        put_get_delete_list(&integration).await;
+        get_opts(&integration).await;
+        list_uses_directories_correctly(&integration).await;
+        list_with_delimiter(&integration).await;
+        rename_and_copy(&integration).await;
+        copy_if_not_exists(&integration).await;
+        stream_get(&integration).await;
+        put_opts(&integration, true).await;
+        // multipart(&integration, &integration).await;
+        // put_get_attributes(&integration).await;
     }
 }
