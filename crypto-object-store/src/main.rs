@@ -115,6 +115,9 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     let path = path.as_str();
     let joined = String::from("file://") + path;
     let table_uri = joined.as_str();
+
+    let _ = fs::remove_dir_all(path);
+    fs::create_dir(path)?;
     
     let kms = Arc::new(KmsNone::new());
     let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?);
@@ -167,7 +170,7 @@ async fn delta_table_read_write(
 ) -> Result<Result<(), DeltaTableError>, DeltaTableError> {
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
-
+    
     info!("start DeltaTableBuilder::build");
 
     let mut table = DeltaTableBuilder::from_valid_uri(table_uri)
