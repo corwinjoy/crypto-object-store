@@ -111,8 +111,8 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
     let joined = String::from("file://") + path;
     let table_uri = joined.as_str();
     let kms = Arc::new(KMS::new(b"password"));
-    let file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?); // Starting ObjectStore
-    // let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?); // Starting ObjectStore
+    let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?); 
+    // let encrypted_file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?); 
 
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
@@ -121,7 +121,7 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
 
     let mut table = DeltaTableBuilder::from_valid_uri(table_uri)
         .unwrap()
-        .with_storage_backend(file_store, Url::parse(table_uri).unwrap())
+        .with_storage_backend(encrypted_file_store, Url::parse(table_uri).unwrap())
         .build()?;
 
     info!("finish DeltaTableBuilder::build");

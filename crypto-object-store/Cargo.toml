@@ -18,3 +18,4 @@ show-bytes = "0.2.0"
 futures = "0.3.31"
 cached = "0.55.1"
 object_store_std = { package = "object_store", version = "0.11.2", features = ["integration"] }
+rand = "0.9.1"

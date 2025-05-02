@@ -213,7 +213,15 @@ impl CryptFileSystem {
         let bytes = gr.bytes().await?;
 
         // Decrypt
-        let decrypted = self.decrypt(location, &*bytes).unwrap();
+        let decrypted = self.decrypt(location, &*bytes);
+        if decrypted.is_err() {
+            let msg = format!(
+                "Cocoon Decryption Error: {} ",
+                decrypted.unwrap_err(),
+            );
+            return Err(object_store::Error::Generic { store: "CryptFileSystem", source: msg.into()});
+        };
+        let decrypted = decrypted.unwrap();
         if gr_range.start_bound() == Bound::Unbounded && gr_range.end_bound() == Bound::Unbounded {
             // Only cache full get
             self.set_cache(location, decrypted.clone());
@@ -246,7 +254,15 @@ impl CryptFileSystem {
         // self.set_cache(location, bytes.to_vec());
 
         // Encrypt
-        let encrypted = self.encrypt(location, &*bytes).unwrap();
+        let encrypted = self.encrypt(location, &*bytes);
+        if encrypted.is_err() {
+            let msg = format!(
+                "Cocoon Encryption Error: {} ",
+                encrypted.unwrap_err(),
+            );
+            return Err(object_store::Error::Generic { store: "CryptFileSystem", source: msg.into()});
+        };
+        let encrypted = encrypted.unwrap();
         let encrypted_payload = PutPayload::from(encrypted);
         Ok(encrypted_payload)
     }
@@ -430,24 +446,23 @@ impl ObjectStore for CryptFileSystem {
 #[cfg(test)]
 mod tests {
     use object_store_std::integration::*;
+    use rand::{rng, Rng};
     use super::*;
 
     // A KMS that disables encryption for basic tests
     #[derive(Debug, Clone)]
     pub struct KmsNone {
-        /// Encryption key
-        crypt_key: Vec<u8>, // TODO: A fancy key lookup here
     }
 
     impl KmsNone {
         pub fn new() -> Self {
-            KmsNone { crypt_key: Vec::from("") }
+            KmsNone { }
         }
     }
 
     impl Display for KmsNone {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            write!(f, "crypt_key: {}", show_bytes(self.crypt_key.clone()))
+            write!(f, "KmsNone")
         }
     }
 
@@ -457,9 +472,24 @@ mod tests {
         }
     }
 
+    /// Returns a chunk of length `chunk_length`
+    fn get_chunk(chunk_length: usize) -> Bytes {
+        let mut data = vec![0_u8; chunk_length];
+        let mut rng = rng();
+        // Set a random selection of bytes
+        for _ in 0..1000 {
+            data[rng.random_range(0..chunk_length)] = rng.random();
+        }
+        data.into()
+    }
+
+    /// Returns `num_chunks` of length `chunks`
+    fn get_chunks(chunk_length: usize, num_chunks: usize) -> Vec<Bytes> {
+        (0..num_chunks).map(|_| get_chunk(chunk_length)).collect()
+    }
+
     #[tokio::test]
-    async fn in_memory_test() {
-        // let integration = InMemory::new();
+    async fn integration_test_no_encryption() {
         let kms = Arc::new(KmsNone::new());
         let integration: Box<dyn ObjectStore> = 
             Box::new(CryptFileSystem::new("memory://", kms).unwrap());
@@ -472,7 +502,49 @@ mod tests {
         copy_if_not_exists(&integration).await;
         stream_get(&integration).await;
         put_opts(&integration, true).await;
-        // multipart(&integration, &integration).await;
-        // put_get_attributes(&integration).await;
+        put_get_attributes(&integration).await;
+    }
+
+    #[tokio::test]
+    async fn put_get_test() {
+        let kms = Arc::new(KMS::new(b"password"));
+        let storage: Box<dyn ObjectStore> =
+            Box::new(CryptFileSystem::new("memory://", kms).unwrap());
+
+        let location = Path::from("test_dir/test_file.json");
+
+        let data = Bytes::from("arbitrary data");
+        storage.put(&location, data.clone().into()).await.unwrap();
+
+        let read_data = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(&*read_data, data);
+
+        // Test range request
+        let range = 3..7;
+        let range_result = storage.get_range(&location, range.clone()).await;
+
+        let bytes = range_result.unwrap();
+        assert_eq!(bytes, data.slice(range.clone()));
+    }
+    
+    #[tokio::test]
+    async fn put_multipart_test() {
+        let kms = Arc::new(KMS::new(b"password"));
+        let storage: Box<dyn ObjectStore> =
+            Box::new(CryptFileSystem::new("memory://", kms).unwrap());
+
+        let location = Path::from("test_dir/test_upload_file.txt");
+
+        // Can write to storage
+        let data = get_chunks(5 * 1024 * 1024, 3);
+        let bytes_expected = data.concat();
+        let mut upload = storage.put_multipart(&location).await.unwrap();
+        let uploads = data.into_iter().map(|x| upload.put_part(x.into()));
+        futures::future::try_join_all(uploads).await.unwrap();
+        
+        upload.complete().await.unwrap();
+
+        let bytes_written = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes_expected, bytes_written);
     }
 }
