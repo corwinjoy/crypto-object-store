@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 //use log::{info, trace, warn};
 use cached::Cached;
 use cached::stores::SizedCache;
+use cocoon::{Cocoon, Creation};
 use futures::StreamExt;
 use log::warn;
 use object_store_std::GetRange;
@@ -291,6 +292,12 @@ impl CryptFileSystem {
         dc.cache_clear();
     }
 
+
+    fn get_cocoon(key: &Vec<u8>) -> Cocoon<Creation> {
+        cocoon::Cocoon::new(key.as_slice()).with_cipher(cocoon::CocoonCipher::Aes256Gcm)
+            .with_weak_kdf()  // Assuming the KMS returns a strong key, we can use fewer KDF iterations
+    }
+    
     pub fn encrypt(
         &self,
         location: &Path,
@@ -302,8 +309,7 @@ impl CryptFileSystem {
             return Ok(Vec::from(data));
         }
         let key = key.unwrap();
-        let mut cocoon =
-            cocoon::Cocoon::new(key.as_slice()).with_cipher(cocoon::CocoonCipher::Aes256Gcm);
+        let mut cocoon = Self::get_cocoon(&key);
         let encrypted = cocoon.wrap(data)?;
         Ok(encrypted)
     }
@@ -319,8 +325,7 @@ impl CryptFileSystem {
             return Ok(Vec::from(data));
         }
         let key = key.unwrap();
-        let cocoon =
-            cocoon::Cocoon::new(key.as_slice()).with_cipher(cocoon::CocoonCipher::Aes256Gcm);
+        let cocoon = Self::get_cocoon(&key);
         let decrypted = cocoon.unwrap(data)?;
         Ok(decrypted)
     }
