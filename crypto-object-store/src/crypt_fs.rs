@@ -16,6 +16,7 @@ use cached::Cached;
 use cached::stores::SizedCache;
 use futures::StreamExt;
 use log::warn;
+use object_store_std::GetRange;
 use object_store_std::multipart::{MultipartStore, PartId};
 use show_bytes::show_bytes;
 use url::Url;
@@ -82,6 +83,138 @@ impl GetCryptKey for KmsNone {
     }
 }
 
+// Cached GetResult values
+#[derive(Debug, Clone)]
+pub struct GetResultCache {
+    /// The [`GetResultPayload`]
+    pub bytes: Bytes,
+    /// The [`ObjectMeta`] for this object
+    pub meta: ObjectMeta,
+    /// Additional object attributes
+    pub attributes: Attributes,
+}
+
+pub fn object_store_from_uri(
+    prefix_uri: impl AsRef<str>,
+) -> object_store::Result<Arc<dyn ObjectStore>> {
+    let url = Url::parse(prefix_uri.as_ref());
+    if url.is_err() {
+        let msg = format!("Invalid URI: \"{}\" ", prefix_uri.as_ref(),);
+        return Err(object_store::Error::Generic {
+            store: "CryptFileSystem",
+            source: msg.into(),
+        });
+    }
+
+    let url = url.unwrap();
+
+    match url.scheme() {
+        "file" => {
+            let path = url.to_file_path().map_err(|_| {
+                let msg = format!(
+                    "URI Does not specify valid path \"{}\": ",
+                    prefix_uri.as_ref(),
+                );
+                object_store::Error::Generic {
+                    store: "CryptFileSystem",
+                    source: msg.into(),
+                }
+            })?;
+            Ok(Arc::new(LocalFileSystem::new_with_prefix(path)?))
+        }
+        "memory" => Ok(Arc::new(InMemory::new())),
+        _ => {
+            let msg = format!("Unrecognized URI scheme \"{}\".", url.scheme(),);
+            Err(object_store::Error::Generic {
+                store: "CryptFileSystem",
+                source: msg.into(),
+            })
+        }
+    }
+}
+
+// Have to reimplement this because GetRange does not expose GetRange::as_range()
+pub fn get_range_to_range(gr: Option<&GetRange>, len: usize) -> object_store_std::Result<Range<usize>, object_store::Error> {
+    if gr.is_none() {
+        return Ok(0..len);
+    }
+    let gr = gr.unwrap();
+    match gr {
+        GetRange::Bounded(r) => {
+            if r.start >= len {
+                let msg = format!(
+                    "Range start {} must not be greater than buffer length {}",
+                    r.start, len,
+                );
+                Err(object_store::Error::Generic {
+                    store: "CryptFileSystem",
+                    source: msg.into(),
+                })
+            } else if r.end > len {
+                Ok(r.start..len)
+            } else {
+                Ok(r.clone())
+            }
+        }
+        GetRange::Offset(o) => {
+            if *o >= len {
+                let msg = format!(
+                    "Range start {} must not be greater than buffer length {}",
+                    *o, len,
+                );
+                Err(object_store::Error::Generic {
+                    store: "CryptFileSystem",
+                    source: msg.into(),
+                })
+            } else {
+                Ok(*o..len)
+            }
+        }
+        GetRange::Suffix(n) => Ok(len.saturating_sub(*n)..len),
+    }
+}
+
+pub fn check_bytes_slice(
+    len: usize,
+    range: impl RangeBounds<usize>,
+) -> Result<(), object_store::Error> {
+    use core::ops::Bound;
+
+    let begin = match range.start_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n.checked_add(1).expect("out of range"),
+        Bound::Unbounded => 0,
+    };
+
+    let end = match range.end_bound() {
+        Bound::Included(&n) => n.checked_add(1).expect("out of range"),
+        Bound::Excluded(&n) => n,
+        Bound::Unbounded => len,
+    };
+
+    if begin > end {
+        let msg = format!(
+            "Range start must not be greater than end: [{}..{}] ",
+            begin, end,
+        );
+        return Err(object_store::Error::Generic {
+            store: "CryptFileSystem",
+            source: msg.into(),
+        });
+    }
+
+    if end > len {
+        let msg = format!("Range end out of bounds: [{}..{}] ", begin, end,);
+        return Err(object_store::Error::Generic {
+            store: "CryptFileSystem",
+            source: msg.into(),
+        });
+    }
+
+    Ok(())
+}
+
+
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
     /// The underlying object store
@@ -90,8 +223,8 @@ pub struct CryptFileSystem {
     /// Class to associate path locations with encryption keys
     kms: Arc<dyn GetCryptKey>,
 
-    /// Cache for decrypted files
-    decrypted_cache: Arc<Mutex<SizedCache<Path, Vec<u8>>>>,
+    /// Cache for decrypted GetResult values
+    decrypted_cache: Arc<Mutex<SizedCache<Path, GetResultCache>>>,
 }
 
 impl Display for CryptFileSystem {
@@ -105,7 +238,7 @@ impl CryptFileSystem {
         prefix_uri: impl AsRef<str>,
         kms: Arc<dyn GetCryptKey>,
     ) -> object_store::Result<Self> {
-        let os = CryptFileSystem::object_store_from_uri(prefix_uri)?;
+        let os = object_store_from_uri(prefix_uri)?;
         Ok(Self {
             os,
             kms: kms.clone(),
@@ -113,57 +246,41 @@ impl CryptFileSystem {
         })
     }
 
-    pub fn object_store_from_uri(
-        prefix_uri: impl AsRef<str>,
-    ) -> object_store::Result<Arc<dyn ObjectStore>> {
-        let url = Url::parse(prefix_uri.as_ref());
-        if url.is_err() {
-            let msg = format!("Invalid URI: \"{}\" ", prefix_uri.as_ref(),);
-            return Err(object_store::Error::Generic {
-                store: "CryptFileSystem",
-                source: msg.into(),
-            });
-        }
-
-        let url = url.unwrap();
-
-        match url.scheme() {
-            "file" => {
-                let path = url.to_file_path().map_err(|_| {
-                    let msg = format!(
-                        "URI Does not specify valid path \"{}\": ",
-                        prefix_uri.as_ref(),
-                    );
-                    object_store::Error::Generic {
-                        store: "CryptFileSystem",
-                        source: msg.into(),
-                    }
-                })?;
-                Ok(Arc::new(LocalFileSystem::new_with_prefix(path)?))
-            }
-            "memory" => Ok(Arc::new(InMemory::new())),
-            _ => {
-                let msg = format!("Unrecognized URI scheme \"{}\".", url.scheme(),);
-                Err(object_store::Error::Generic {
-                    store: "CryptFileSystem",
-                    source: msg.into(),
-                })
-            }
-        }
-    }
 
     // Add decrypted data to cache
-    fn set_cache(&self, location: &Path, data: Vec<u8>) {
+    fn set_cache(&self, location: &Path, gr: GetResultCache) {
         let mut dc = self.decrypted_cache.lock().unwrap();
-        dc.cache_set(location.clone(), data);
+        dc.cache_set(location.clone(), gr);
     }
 
     // Check cache for decrypted data
-    fn get_cache(&self, location: &Path) -> Option<Vec<u8>> {
+    fn get_cache(&self, location: &Path) -> Option<GetResultCache> {
         let mut dc = self.decrypted_cache.lock().unwrap();
-        dc.cache_get(location).map(Vec::clone)
+        dc.cache_get(location).map(GetResultCache::clone)
     }
 
+    fn get_cached_getresult(&self, location: &Path, options: Option<&GetOptions>) -> Result<Option<GetResult>, object_store::Error> {
+        let cache = self.get_cache(location);
+        if cache.is_none() {
+            return Ok(None);
+        }
+        let cache: GetResultCache = cache.unwrap();
+        
+        let target_range = match options {
+            Some(opts) => {opts.range.as_ref()},
+            None => None
+        };
+        let range = get_range_to_range(target_range, cache.bytes.len())?;
+        let bytes = cache.bytes.slice(range.clone());
+        let stream = futures::stream::once(futures::future::ready(Ok(bytes)));
+        Ok(Some(GetResult {
+            payload: GetResultPayload::Stream(stream.boxed()),
+            meta: cache.meta,
+            range,
+            attributes: cache.attributes,
+        }))
+    }
+    
     fn clear_cache(&self) {
         let mut dc = self.decrypted_cache.lock().unwrap();
         dc.cache_clear();
@@ -202,64 +319,16 @@ impl CryptFileSystem {
         let decrypted = cocoon.unwrap(data)?;
         Ok(decrypted)
     }
-
-    pub fn check_bytes_slice(
-        len: usize,
-        range: impl RangeBounds<usize>,
-    ) -> Result<(), object_store::Error> {
-        use core::ops::Bound;
-
-        let begin = match range.start_bound() {
-            Bound::Included(&n) => n,
-            Bound::Excluded(&n) => n.checked_add(1).expect("out of range"),
-            Bound::Unbounded => 0,
-        };
-
-        let end = match range.end_bound() {
-            Bound::Included(&n) => n.checked_add(1).expect("out of range"),
-            Bound::Excluded(&n) => n,
-            Bound::Unbounded => len,
-        };
-
-        if begin > end {
-            let msg = format!(
-                "Range start must not be greater than end: [{}..{}] ",
-                begin, end,
-            );
-            return Err(object_store::Error::Generic {
-                store: "CryptFileSystem",
-                source: msg.into(),
-            });
-        }
-
-        if end > len {
-            let msg = format!("Range end out of bounds: [{}..{}] ", begin, end,);
-            return Err(object_store::Error::Generic {
-                store: "CryptFileSystem",
-                source: msg.into(),
-            });
-        }
-
-        Ok(())
-    }
-
+    
     async fn decrypted_bytes(
         &self,
         location: &Path,
         gr: GetResult,
     ) -> Result<Bytes, object_store::Error> {
-        // Check cache
-        let cache = self.get_cache(location);
-        if cache.is_some() {
-            let r = gr.range.clone();
-            let v = cache.unwrap();
-            CryptFileSystem::check_bytes_slice(v.len(), r.clone())?;
-            let bytes = Bytes::from(Vec::from(v));
-            return Ok(bytes.slice(r));
-        }
-
         // Buffer the payload in memory
         let gr_range = gr.range.clone();
+        let meta = gr.meta.clone();
+        let attributes = gr.attributes.clone();
         let bytes = gr.bytes().await?;
 
         // Decrypt
@@ -274,14 +343,18 @@ impl CryptFileSystem {
         let decrypted = decrypted.unwrap();
         if gr_range.start_bound() == Bound::Unbounded && gr_range.end_bound() == Bound::Unbounded {
             // Only cache full get
-            self.set_cache(location, decrypted.clone());
+            self.set_cache(location, GetResultCache{
+                bytes: Bytes::from(decrypted.clone()),
+                meta,
+                attributes,                
+            });
         }
 
         // Convert to bytes
         let db = Bytes::from(decrypted);
         Ok(db)
     }
-
+    
     async fn encrypted_payloads(
         &self,
         location: &Path,
@@ -302,8 +375,7 @@ impl CryptFileSystem {
         let result: GetResult = ms.get(&tmp).await?;
         let bytes = result.bytes().await?;
 
-        // Only cache on get because write to underlying system
-        // may fail.
+        // Only cache on get because write to underlying system may fail.
         // self.set_cache(location, bytes.to_vec());
 
         // Encrypt
@@ -452,6 +524,10 @@ impl ObjectStore for CryptFileSystem {
 
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
         warn!("get: {location}");
+        let cache = self.get_cached_getresult(location, None)?;
+        if cache.is_some() {
+            return Ok(cache.unwrap());
+        }
         let gr = self.os.get(location).await?;
         self.decrypted_get_result(location, gr).await
     }
@@ -462,15 +538,25 @@ impl ObjectStore for CryptFileSystem {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         warn!("get_opts: {location}");
+        let cache = self.get_cached_getresult(location, Some(&options))?;
+        if cache.is_some() {
+            return Ok(cache.unwrap());
+        }
         let gr = self.os.get_opts(location, options).await?;
         self.decrypted_get_result(location, gr).await
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
         warn!("get_range: {location}");
-        let gr = self.os.get(location).await?;
-        let db = self.decrypted_bytes(location, gr).await?;
-        CryptFileSystem::check_bytes_slice(db.len(), range.clone())?;
+        let cache = self.get_cache(location);
+        let db = match cache {
+            Some(cache) => cache.bytes,
+            None => {
+                let gr = self.os.get(location).await?;
+                self.decrypted_bytes(location, gr).await?
+            }
+        };
+        check_bytes_slice(db.len(), range.clone())?;
         Ok(db.slice(range))
     }
 
@@ -480,12 +566,21 @@ impl ObjectStore for CryptFileSystem {
         ranges: &[Range<usize>],
     ) -> object_store::Result<Vec<Bytes>> {
         warn!("get_ranges: {location}");
-        let gr = self.os.get(location).await?;
-        let db = self.decrypted_bytes(location, gr).await?;
+        let cache = self.get_cache(location);
+        let db = match cache {
+            Some(cache) => cache.bytes,
+            None => {
+                let gr = self.os.get(location).await?;
+                self.decrypted_bytes(location, gr).await?
+            }
+        };
         let ranges = ranges.to_vec();
         ranges
             .into_iter()
-            .map(|range| Ok(db.slice(range)))
+            .map(|range| {
+                check_bytes_slice(db.len(), range.clone())?;
+                Ok(db.slice(range))
+            })
             .collect()
     }
 
