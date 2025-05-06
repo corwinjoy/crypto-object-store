@@ -134,7 +134,10 @@ pub fn object_store_from_uri(
 }
 
 // Have to reimplement this because GetRange does not expose GetRange::as_range()
-pub fn get_range_to_range(gr: Option<&GetRange>, len: usize) -> object_store_std::Result<Range<usize>, object_store::Error> {
+pub fn get_range_to_range(
+    gr: Option<&GetRange>,
+    len: usize,
+) -> object_store_std::Result<Range<usize>, object_store::Error> {
     if gr.is_none() {
         return Ok(0..len);
     }
@@ -214,7 +217,6 @@ pub fn check_bytes_slice(
     Ok(())
 }
 
-
 #[derive(Debug, Clone)]
 pub struct CryptFileSystem {
     /// The underlying object store
@@ -246,7 +248,6 @@ impl CryptFileSystem {
         })
     }
 
-
     // Add decrypted data to cache
     fn set_cache(&self, location: &Path, gr: GetResultCache) {
         let mut dc = self.decrypted_cache.lock().unwrap();
@@ -259,16 +260,20 @@ impl CryptFileSystem {
         dc.cache_get(location).map(GetResultCache::clone)
     }
 
-    fn get_cached_getresult(&self, location: &Path, options: Option<&GetOptions>) -> Result<Option<GetResult>, object_store::Error> {
+    fn get_cached_getresult(
+        &self,
+        location: &Path,
+        options: Option<&GetOptions>,
+    ) -> Result<Option<GetResult>, object_store::Error> {
         let cache = self.get_cache(location);
         if cache.is_none() {
             return Ok(None);
         }
         let cache: GetResultCache = cache.unwrap();
-        
+
         let target_range = match options {
-            Some(opts) => {opts.range.as_ref()},
-            None => None
+            Some(opts) => opts.range.as_ref(),
+            None => None,
         };
         let range = get_range_to_range(target_range, cache.bytes.len())?;
         let bytes = cache.bytes.slice(range.clone());
@@ -280,7 +285,7 @@ impl CryptFileSystem {
             attributes: cache.attributes,
         }))
     }
-    
+
     fn clear_cache(&self) {
         let mut dc = self.decrypted_cache.lock().unwrap();
         dc.cache_clear();
@@ -319,7 +324,7 @@ impl CryptFileSystem {
         let decrypted = cocoon.unwrap(data)?;
         Ok(decrypted)
     }
-    
+
     async fn decrypted_bytes(
         &self,
         location: &Path,
@@ -343,18 +348,21 @@ impl CryptFileSystem {
         let decrypted = decrypted.unwrap();
         if gr_range.start_bound() == Bound::Unbounded && gr_range.end_bound() == Bound::Unbounded {
             // Only cache full get
-            self.set_cache(location, GetResultCache{
-                bytes: Bytes::from(decrypted.clone()),
-                meta,
-                attributes,                
-            });
+            self.set_cache(
+                location,
+                GetResultCache {
+                    bytes: Bytes::from(decrypted.clone()),
+                    meta,
+                    attributes,
+                },
+            );
         }
 
         // Convert to bytes
         let db = Bytes::from(decrypted);
         Ok(db)
     }
-    
+
     async fn encrypted_payloads(
         &self,
         location: &Path,

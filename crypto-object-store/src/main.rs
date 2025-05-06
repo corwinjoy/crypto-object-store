@@ -118,18 +118,28 @@ async fn main() -> Result<(), deltalake::errors::DeltaTableError> {
 
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
-    
+
     let kms = Arc::new(KmsNone::new());
     let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?);
-    timed_delta_table_read_write("ObjectStore with **NO** Encryption", path, table_uri, encrypted_file_store)
-        .await
-        .expect("Error in encrypted read/write");
+    timed_delta_table_read_write(
+        "ObjectStore with **NO** Encryption",
+        path,
+        table_uri,
+        encrypted_file_store,
+    )
+    .await
+    .expect("Error in encrypted read/write");
 
     let kms = Arc::new(KMS::new(b"password"));
     let encrypted_file_store = Arc::new(CryptFileSystem::new(table_uri, kms)?);
-    timed_delta_table_read_write("ObjectStore with Encryption", path, table_uri, encrypted_file_store)
-        .await
-        .expect("Error in encrypted read/write");
+    timed_delta_table_read_write(
+        "ObjectStore with Encryption",
+        path,
+        table_uri,
+        encrypted_file_store,
+    )
+    .await
+    .expect("Error in encrypted read/write");
 
     let file_store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
     timed_delta_table_read_write("Raw LocalFileSystem", path, table_uri, file_store)
@@ -170,7 +180,7 @@ async fn delta_table_read_write(
 ) -> Result<Result<(), DeltaTableError>, DeltaTableError> {
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
-    
+
     info!("start DeltaTableBuilder::build");
 
     let mut table = DeltaTableBuilder::from_valid_uri(table_uri)
