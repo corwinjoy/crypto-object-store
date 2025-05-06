@@ -23,13 +23,12 @@ use show_bytes::show_bytes;
 use url::Url;
 
 pub trait GetCryptKey: Display + Send + Sync + Debug {
-    
     /*
-     The idea of get_key is to return one of 3 options
-     1. Ok(Some(key)): a key corresponding to the given location
-     2. Ok(None): No key. Do not use encryption for this location
-     3. Error: User is not authorized, cannot connect to KMS server, etc.
-     */
+    The idea of get_key is to return one of 3 options
+    1. Ok(Some(key)): a key corresponding to the given location
+    2. Ok(None): No key. Do not use encryption for this location
+    3. Error: User is not authorized, cannot connect to KMS server, etc.
+    */
     fn get_key(&self, location: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>>;
 }
 
@@ -299,10 +298,10 @@ impl CryptFileSystem {
         dc.cache_clear();
     }
 
-
     fn get_cocoon(key: &Vec<u8>) -> Cocoon<Creation> {
-        cocoon::Cocoon::new(key.as_slice()).with_cipher(cocoon::CocoonCipher::Aes256Gcm)
-            .with_weak_kdf()  // Assuming the KMS returns a strong key, we can use fewer KDF iterations
+        cocoon::Cocoon::new(key.as_slice())
+            .with_cipher(cocoon::CocoonCipher::Aes256Gcm)
+            .with_weak_kdf() // Assuming the KMS returns a strong key, we can use fewer KDF iterations
     }
 
     pub fn encrypt(
