@@ -23,7 +23,14 @@ use show_bytes::show_bytes;
 use url::Url;
 
 pub trait GetCryptKey: Display + Send + Sync + Debug {
-    fn get_key(&self, location: &Path) -> Option<Vec<u8>>;
+    
+    /*
+     The idea of get_key is to return one of 3 options
+     1. Ok(Some(key)): a key corresponding to the given location
+     2. Ok(None): No key. Do not use encryption for this location
+     3. Error: User is not authorized, cannot connect to KMS server, etc.
+     */
+    fn get_key(&self, location: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>>;
 }
 
 // A simple key management stub to associate path locations
@@ -49,16 +56,16 @@ impl Display for KMS {
 }
 
 impl GetCryptKey for KMS {
-    fn get_key(&self, location: &Path) -> Option<Vec<u8>> {
+    fn get_key(&self, location: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         // process the path location to get the associated encryption key
         // return None if there is no such associated key
 
         // As an example application, we leave the delta_log / metadata files unencrypted
         if location.prefix_matches(&Path::from("/_delta_log")) {
-            return None;
+            return Ok(None);
         }
 
-        Some(self.crypt_key.clone())
+        Ok(Some(self.crypt_key.clone()))
     }
 }
 
@@ -79,8 +86,8 @@ impl Display for KmsNone {
 }
 
 impl GetCryptKey for KmsNone {
-    fn get_key(&self, _location: &Path) -> Option<Vec<u8>> {
-        return None;
+    fn get_key(&self, _location: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        return Ok(None);
     }
 }
 
@@ -297,13 +304,13 @@ impl CryptFileSystem {
         cocoon::Cocoon::new(key.as_slice()).with_cipher(cocoon::CocoonCipher::Aes256Gcm)
             .with_weak_kdf()  // Assuming the KMS returns a strong key, we can use fewer KDF iterations
     }
-    
+
     pub fn encrypt(
         &self,
         location: &Path,
         data: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let key = self.kms.get_key(location);
+        let key = self.kms.get_key(location)?;
         if key.is_none() {
             // No encryption
             return Ok(Vec::from(data));
@@ -319,7 +326,7 @@ impl CryptFileSystem {
         location: &Path,
         data: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let key = self.kms.get_key(location);
+        let key = self.kms.get_key(location)?;
         if key.is_none() {
             // No encryption
             return Ok(Vec::from(data));
