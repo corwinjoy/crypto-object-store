@@ -1,3 +1,4 @@
+use futures::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cocoon;
@@ -7,9 +8,10 @@ use deltalake_core::storage::object_store::{GetResultPayload, UploadPart, memory
 use object_store::{
     Attributes, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStore, PutMultipartOpts,
     PutOptions, PutPayload, PutResult, local::LocalFileSystem,
+    GetRange, multipart::{MultipartStore, PartId}
 };
 use std::fmt::{Debug, Display, Formatter};
-use std::ops::{Bound, Range, RangeBounds};
+use std::ops::{Range, RangeBounds};
 use std::sync::{Arc, Mutex};
 //use log::{info, trace, warn};
 use cached::Cached;
@@ -17,8 +19,6 @@ use cached::stores::SizedCache;
 use cocoon::{Cocoon, Creation};
 use futures::StreamExt;
 use log::warn;
-use object_store_std::GetRange;
-use object_store_std::multipart::{MultipartStore, PartId};
 use show_bytes::show_bytes;
 use url::Url;
 
@@ -30,6 +30,9 @@ pub trait GetCryptKey: Display + Send + Sync + Debug {
     3. Error: User is not authorized, cannot connect to KMS server, etc.
     */
     fn get_key(&self, location: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>>;
+    
+    // Return true if location has an encryption key
+    fn has_key(&self, location: &Path) -> bool;
 }
 
 // A simple key management stub to associate path locations
@@ -66,6 +69,13 @@ impl GetCryptKey for KMS {
 
         Ok(Some(self.crypt_key.clone()))
     }
+
+    fn has_key(&self, location: &Path) -> bool {
+        if location.prefix_matches(&Path::from("/_delta_log")) {
+            return true;
+        }
+        false
+    }
 }
 
 // A KMS that disables encryption for basic tests
@@ -87,6 +97,10 @@ impl Display for KmsNone {
 impl GetCryptKey for KmsNone {
     fn get_key(&self, _location: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         return Ok(None);
+    }
+
+    fn has_key(&self, _location: &Path) -> bool {
+        false
     }
 }
 
@@ -267,6 +281,18 @@ impl CryptFileSystem {
         dc.cache_get(location).map(GetResultCache::clone)
     }
 
+    // Clear single item from cache
+    fn clear_cache_item(&self, location: &Path) {
+        let mut dc = self.decrypted_cache.lock().unwrap();
+        dc.cache_remove(location);
+    }
+
+    pub fn clear_cache(&self) {
+        let mut dc = self.decrypted_cache.lock().unwrap();
+        dc.cache_clear();
+    }
+
+
     fn get_cached_getresult(
         &self,
         location: &Path,
@@ -292,12 +318,7 @@ impl CryptFileSystem {
             attributes: cache.attributes,
         }))
     }
-
-    fn clear_cache(&self) {
-        let mut dc = self.decrypted_cache.lock().unwrap();
-        dc.cache_clear();
-    }
-
+    
     fn get_cocoon(key: &Vec<u8>) -> Cocoon<Creation> {
         cocoon::Cocoon::new(key.as_slice())
             .with_cipher(cocoon::CocoonCipher::Aes256Gcm)
@@ -335,14 +356,21 @@ impl CryptFileSystem {
         let decrypted = cocoon.unwrap(data)?;
         Ok(decrypted)
     }
+    
+    pub fn adjust_meta_size(&self,
+                            meta: &mut ObjectMeta) {
+        if self.kms.has_key(&meta.location) {
+            meta.size = meta.size - cocoon::PREFIX_SIZE;
+        }
+    }
 
     async fn decrypted_bytes(
         &self,
         location: &Path,
         gr: GetResult,
+        add_to_cache: bool,
     ) -> Result<Bytes, object_store::Error> {
         // Buffer the payload in memory
-        let gr_range = gr.range.clone();
         let meta = gr.meta.clone();
         let attributes = gr.attributes.clone();
         let bytes = gr.bytes().await?;
@@ -357,8 +385,8 @@ impl CryptFileSystem {
             });
         };
         let decrypted = decrypted.unwrap();
-        if gr_range.start_bound() == Bound::Unbounded && gr_range.end_bound() == Bound::Unbounded {
-            // Only cache full get
+        
+        if add_to_cache {
             self.set_cache(
                 location,
                 GetResultCache {
@@ -368,7 +396,8 @@ impl CryptFileSystem {
                 },
             );
         }
-
+        
+        
         // Convert to bytes
         let db = Bytes::from(decrypted);
         Ok(db)
@@ -396,6 +425,9 @@ impl CryptFileSystem {
 
         // Only cache on get because write to underlying system may fail.
         // self.set_cache(location, bytes.to_vec());
+        
+        // Clear any existing cache at this location
+        self.clear_cache_item(location);
 
         // Encrypt
         let encrypted = self.encrypt(location, &*bytes);
@@ -424,12 +456,18 @@ impl CryptFileSystem {
         &self,
         location: &Path,
         gr: GetResult,
+        target_range: Option<GetRange>,
+        add_to_cache: bool,
     ) -> object_store::Result<GetResult> {
         let meta = gr.meta.clone();
-        let range = gr.range.clone();
         let attributes = gr.attributes.clone();
 
-        let db = self.decrypted_bytes(location, gr).await?;
+        let db = self.decrypted_bytes(location, gr, add_to_cache).await?;
+        let range: Range<usize> = match target_range {
+            Some(target_range) => get_range_to_range(Some(&target_range), db.len())?,
+            None => 0..db.len()
+        };
+        let db = db.slice(range.clone());
         let stream = futures::stream::once(futures::future::ready(Ok(db)));
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream.boxed()),
@@ -548,7 +586,7 @@ impl ObjectStore for CryptFileSystem {
             return Ok(cache.unwrap());
         }
         let gr = self.os.get(location).await?;
-        self.decrypted_get_result(location, gr).await
+        self.decrypted_get_result(location, gr, None, true).await
     }
 
     async fn get_opts(
@@ -557,12 +595,24 @@ impl ObjectStore for CryptFileSystem {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         warn!("get_opts: {location}");
-        let cache = self.get_cached_getresult(location, Some(&options))?;
-        if cache.is_some() {
-            return Ok(cache.unwrap());
+        
+        // If false, do not use or set cache because options may restrict fetch
+        let add_to_cache = !options.head && options.if_match.is_none() && options.if_modified_since.is_none() &&
+            options.if_none_match.is_none() && options.if_unmodified_since.is_none() &&
+            options.version.is_none();
+
+        if add_to_cache {
+            let cache = self.get_cached_getresult(location, Some(&options))?;
+            if cache.is_some() {
+                return Ok(cache.unwrap());
+            }
         }
-        let gr = self.os.get_opts(location, options).await?;
-        self.decrypted_get_result(location, gr).await
+        
+        let mut masked_options = options.clone();
+        masked_options.range = None;
+        let gr = self.os.get_opts(location, masked_options).await?;
+        let decrypted_gr = self.decrypted_get_result(location, gr, options.range, add_to_cache).await?;
+        Ok(decrypted_gr)
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
@@ -572,13 +622,13 @@ impl ObjectStore for CryptFileSystem {
             Some(cache) => cache.bytes,
             None => {
                 let gr = self.os.get(location).await?;
-                self.decrypted_bytes(location, gr).await?
+                self.decrypted_bytes(location, gr, true).await?
             }
         };
         check_bytes_slice(db.len(), range.clone())?;
         Ok(db.slice(range))
     }
-
+    
     async fn get_ranges(
         &self,
         location: &Path,
@@ -590,7 +640,7 @@ impl ObjectStore for CryptFileSystem {
             Some(cache) => cache.bytes,
             None => {
                 let gr = self.os.get(location).await?;
-                self.decrypted_bytes(location, gr).await?
+                self.decrypted_bytes(location, gr, true).await?
             }
         };
         let ranges = ranges.to_vec();
@@ -608,7 +658,9 @@ impl ObjectStore for CryptFileSystem {
     // be just pass-through
     ////////////////////////////////////////////////////////////////////////////////////
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.os.head(location).await
+        let mut meta = self.os.head(location).await?;
+        self.adjust_meta_size(&mut meta);
+        Ok(meta)
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
@@ -628,7 +680,33 @@ impl ObjectStore for CryptFileSystem {
         &self,
         prefix: Option<&Path>,
     ) -> futures_core::stream::BoxStream<'_, object_store::Result<ObjectMeta>> {
-        self.os.list(prefix)
+        let stream = self.os.list(prefix);
+        
+        let mut objects = futures::executor::block_on(stream.collect::<Vec<object_store::Result<ObjectMeta>>>());
+        for object in objects.iter_mut() {
+            if let Ok(meta) = object {
+                self.adjust_meta_size(meta);
+            }
+        }
+        
+        let adjusted_stream = stream::iter(objects);
+        adjusted_stream.boxed()
+        
+        /*
+        // Can't do this because lifetime of stream may live beyond self
+        let adjusted_stream = stream.map(move |meta| {
+            if let Ok(meta) = &meta {
+                if self.kms.has_key(&meta.location) {
+                    let mut new_meta = meta.clone();
+                    self.adjust_meta_size(&mut new_meta);
+                    return Ok(new_meta);
+                }
+            }
+            meta
+        });
+        adjusted_stream.boxed()
+        
+         */
     }
 
     fn list_with_offset(
@@ -636,11 +714,24 @@ impl ObjectStore for CryptFileSystem {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> futures_core::stream::BoxStream<'_, object_store::Result<ObjectMeta>> {
-        self.os.list_with_offset(prefix, offset)
+        let stream = self.os.list_with_offset(prefix, offset);
+        let mut objects = futures::executor::block_on(stream.collect::<Vec<object_store::Result<ObjectMeta>>>());
+        for object in objects.iter_mut() {
+            if let Ok(meta) = object {
+                self.adjust_meta_size(meta);
+            }
+        }
+
+        let adjusted_stream = stream::iter(objects);
+        adjusted_stream.boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.os.list_with_delimiter(prefix).await
+        let mut lr = self.os.list_with_delimiter(prefix).await?;
+        for meta in lr.objects.iter_mut() {
+            self.adjust_meta_size(meta);
+        }
+        Ok(lr)
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
